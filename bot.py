@@ -6,6 +6,7 @@ Includes extended !статус with cancel buttons.
 import asyncio
 import logging
 import uuid
+import io
 from datetime import datetime, timezone
 from typing import Dict, Any
 
@@ -208,6 +209,7 @@ async def process_blue_request(interaction: discord.Interaction, grade: str, res
 async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, user: discord.User, grade: str, resource: str, character: str, qty: int):
     def check(m: discord.Message):
         return m.author.id == user.id and m.channel.id == channel.id and (m.attachments or (m.content and m.content.lower() == 'отмена'))
+
     try:
         msg: discord.Message = await bot.wait_for('message', timeout=120.0, check=check)
     except asyncio.TimeoutError:
@@ -243,12 +245,35 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
         ACTIVE_SESSIONS.pop(user.id, None)
         return
 
-    loop = asyncio.get_event_loop()
     try:
-        filename = f"{user.id}_{uuid.uuid4().hex}_{attachment.filename}"
-        drive_link = await loop.run_in_executor(None, upload_bytes, filename, content, attachment.content_type)
+        # Используем локальный загрузчик для тестирования
+        if hasattr(config, 'USE_LOCAL_UPLOADER') and config.USE_LOCAL_UPLOADER:
+            # Сохраняем файл локально
+            import os
+            import uuid
+
+            upload_dir = "uploads"
+            os.makedirs(upload_dir, exist_ok=True)
+
+            # Генерируем уникальное имя файла
+            file_id = str(uuid.uuid4())
+            ext = os.path.splitext(attachment.filename)[1] or ".png"
+            new_filename = f"{file_id}{ext}"
+
+            # Сохраняем файл
+            filepath = os.path.join(upload_dir, new_filename)
+            with open(filepath, "wb") as f:
+                f.write(content)
+
+            drive_link = f"Локальный файл: {new_filename}"
+            logger.info(f"Файл сохранен локально: {filepath}")
+        else:
+            # Используем Google Drive
+            loop = asyncio.get_event_loop()
+            filename = f"{user.id}_{uuid.uuid4().hex}_{attachment.filename}"
+            drive_link = await loop.run_in_executor(None, upload_bytes, filename, content, attachment.content_type)
     except Exception as e:
-        logger.exception("Drive upload failed: %s", e)
+        logger.exception("Upload failed: %s", e)
         await channel.send(f"{user.mention}, ошибка при загрузке скриншота.")
         ACTIVE_SESSIONS.pop(user.id, None)
         return
@@ -265,16 +290,27 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
         async with sheets_lock:
             sheets.append_row(row)
             # do not recompute until approved (pending may be part of queue but priority handled)
+
+        # Отправляем файл как вложение в Discord
+        file = discord.File(io.BytesIO(content), filename=attachment.filename)
+
         embed = discord.Embed(title="Новая фиолетовая заявка — требуется подтверждение", color=discord.Color.orange())
         embed.add_field(name="Игрок", value=f"{user.mention}", inline=False)
         embed.add_field(name="Ресурс", value=resource, inline=True)
         embed.add_field(name="Кол-во", value=str(qty), inline=True)
         embed.add_field(name="Персонаж", value=character, inline=False)
-        embed.add_field(name="Скрин", value=drive_link, inline=False)
-        info_msg = await channel.send(f"<@&{config.VERIFIER_ROLE_ID}> Пожалуйста подтвердите (реакция ✅).", embed=embed)
+        embed.add_field(name="Скрин", value=f"Сохранено: {drive_link}", inline=False)
+
+        info_msg = await channel.send(
+            f"<@&{config.VERIFIER_ROLE_ID}> Пожалуйста подтвердите (реакция ✅).",
+            embed=embed,
+            file=file
+        )
+
         await info_msg.add_reaction("✅")
         PENDING_REQUESTS[info_msg.id] = {"row_uuid": rowid, "requester_id": user.id, "channel_id": channel.id, "drive_link": drive_link}
         ACTIVE_SESSIONS.pop(user.id, None)
+
     except Exception as e:
         logger.exception("register pending row failed: %s", e)
         await channel.send(f"{user.mention}, ошибка при регистрации заявки.")
