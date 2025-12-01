@@ -7,6 +7,7 @@ import asyncio
 import logging
 import uuid
 import io
+import os
 from datetime import datetime, timezone
 from typing import Dict, Any
 
@@ -33,7 +34,7 @@ sheets = None
 queue = None
 
 PENDING_REQUESTS: Dict[int, Dict[str, Any]] = {}
-ACTIVE_SESSIONS: Dict[int, bool] = {}  # user_id -> True если в процессе создания заявки
+ACTIVE_SESSIONS: Dict[int, Dict[str, Any]] = {}  # user_id -> session data (для отслеживания активных сессий)
 sheets_lock = asyncio.Lock()
 
 BLUE_RESOURCES = [
@@ -86,9 +87,10 @@ async def stop_stashkeep(ctx, channel: discord.TextChannel = None):
 
 # ----- UI flow -----
 class ResourceSelect(View):
-    def __init__(self, author: discord.Member):
+    def __init__(self, author: discord.Member, session_id: str):
         super().__init__(timeout=120)
         self.author = author
+        self.session_id = session_id
 
         # Создаем опции для селекта
         options = []
@@ -112,6 +114,12 @@ class ResourceSelect(View):
                 await interaction.response.send_message("Это меню не для вас.", ephemeral=True)
                 return
 
+            # Проверяем, что сессия еще активна
+            if interaction.user.id not in ACTIVE_SESSIONS:
+                await interaction.response.send_message("Ваша сессия истекла. Начните заново с `!запрос`.", ephemeral=True)
+                self.stop()
+                return
+
             val = select.values[0]
             # Разделяем значение
             parts = val.split("_", 1)
@@ -122,7 +130,7 @@ class ResourceSelect(View):
                 grade = "Blue"
                 resource = val
 
-            modal = RequestModal(grade=grade, resource=resource, author=self.author)
+            modal = RequestModal(grade=grade, resource=resource, author=self.author, session_id=self.session_id)
             await interaction.response.send_modal(modal)
             self.stop()
 
@@ -131,22 +139,38 @@ class ResourceSelect(View):
 
     async def on_timeout(self):
         # Очищаем сессию при таймауте
-        ACTIVE_SESSIONS.pop(self.author.id, None)
+        if self.author.id in ACTIVE_SESSIONS and ACTIVE_SESSIONS[self.author.id].get("session_id") == self.session_id:
+            # Удаляем сообщение с меню, если оно есть
+            menu_message_id = ACTIVE_SESSIONS[self.author.id].get("menu_message_id")
+            if menu_message_id:
+                try:
+                    channel = bot.get_channel(ACTIVE_SESSIONS[self.author.id].get("channel_id"))
+                    if channel:
+                        msg = await channel.fetch_message(menu_message_id)
+                        await msg.delete()
+                except:
+                    pass
+
+            # Удаляем сессию
+            del ACTIVE_SESSIONS[self.author.id]
 
 class RequestModal(Modal):
-    def __init__(self, grade: str, resource: str, author: discord.Member):
+    def __init__(self, grade: str, resource: str, author: discord.Member, session_id: str):
         super().__init__(title=f"Запрос: {resource}")
         self.grade = grade
         self.resource = resource
         self.author = author
+        self.session_id = session_id
         self.character = TextInput(label="Имя персонажа", placeholder="Например: Ivan")
         self.quantity = TextInput(label="Количество", placeholder="Число, например 1", max_length=6)
         self.add_item(self.character)
         self.add_item(self.quantity)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Очищаем сессию при успешном отправлении
-        ACTIVE_SESSIONS.pop(interaction.user.id, None)
+        # Проверяем, что сессия еще активна
+        if interaction.user.id not in ACTIVE_SESSIONS or ACTIVE_SESSIONS[interaction.user.id].get("session_id") != self.session_id:
+            await interaction.response.send_message("Ваша сессия истекла. Начните заново с `!запрос`.", ephemeral=True)
+            return
 
         try:
             qty = int(self.quantity.value.strip())
@@ -157,21 +181,49 @@ class RequestModal(Modal):
             return
 
         if self.grade.lower().startswith("purple"):
-            await interaction.response.send_message("Пожалуйста, отправьте в этот канал изображение (вложение). Напишите 'отмена' чтобы отменить. У вас 2 минуты.", ephemeral=False)
-            bot.loop.create_task(wait_for_screenshot_and_register(interaction.channel, interaction.user, self.grade, self.resource, self.character.value.strip(), qty))
+            # Сохраняем данные заявки в сессию
+            ACTIVE_SESSIONS[interaction.user.id]["request_data"] = {
+                "grade": self.grade,
+                "resource": self.resource,
+                "character": self.character.value.strip(),
+                "qty": qty
+            }
+
+            # Отправляем сообщение только пользователю
+            await interaction.response.send_message(
+                "Пожалуйста, отправьте в этот канал изображение (вложение). Напишите 'отмена' чтобы отменить. У вас 2 минуты.",
+                ephemeral=True
+            )
+
+            # Запускаем ожидание скриншота
+            bot.loop.create_task(wait_for_screenshot_and_register(
+                interaction.channel,
+                interaction.user,
+                self.grade,
+                self.resource,
+                self.character.value.strip(),
+                qty,
+                self.session_id
+            ))
         else:
-            # Отправляем начальный ответ и создаем задачу
-            await interaction.response.send_message("Обрабатываю ваш запрос...", ephemeral=True)
-            bot.loop.create_task(process_blue_request(interaction, self.grade, self.resource, self.character.value.strip(), qty))
+            # Отправляем начальный ответ и создаем задачу для синих ресурсов
+            await interaction.response.defer(ephemeral=True)
+            bot.loop.create_task(process_blue_request(interaction, self.grade, self.resource, self.character.value.strip(), qty, self.session_id))
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         # Очищаем сессию при ошибке
-        ACTIVE_SESSIONS.pop(interaction.user.id, None)
+        if interaction.user.id in ACTIVE_SESSIONS:
+            del ACTIVE_SESSIONS[interaction.user.id]
         await super().on_error(interaction, error)
 
-async def process_blue_request(interaction: discord.Interaction, grade: str, resource: str, character: str, qty: int):
+async def process_blue_request(interaction: discord.Interaction, grade: str, resource: str, character: str, qty: int, session_id: str):
     """Обрабатывает запрос на синий ресурс в фоновом режиме"""
     try:
+        # Проверяем, что сессия еще активна
+        if interaction.user.id not in ACTIVE_SESSIONS or ACTIVE_SESSIONS[interaction.user.id].get("session_id") != session_id:
+            await interaction.followup.send("Ваша сессия истекла. Начните заново с `!запрос`.", ephemeral=True)
+            return
+
         rowid = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
         msg_id = interaction.message.id if interaction.message else 0
@@ -180,37 +232,64 @@ async def process_blue_request(interaction: discord.Interaction, grade: str, res
             str(qty), str(config.DEFAULT_PRIORITY), now, "", "active", str(interaction.channel.id),
             str(msg_id), rowid, "", "n/a", "", ""
         ]
+
         async with sheets_lock:
             sheets.append_row(row)
             sheets.recompute_queue_positions(resource)
 
-        # Редактируем исходное сообщение с результатом
-        try:
-            await interaction.edit_original_response(content=f"Заявка принята: {resource} x{qty}.")
-        except Exception as e:
-            logger.warning("Не удалось отредактировать сообщение: %s", e)
-            # Пробуем отправить новое сообщение
-            try:
-                await interaction.followup.send(f"Заявка принята: {resource} x{qty}.", ephemeral=True)
-            except Exception:
-                # Если и это не работает, отправляем в канал
-                await interaction.channel.send(f"{interaction.user.mention}, ваша заявка принята: {resource} x{qty}.")
+            # Получаем позицию в очереди
+            rownum = sheets.get_row_number_by_rowid(rowid)
+            if rownum:
+                row_data = sheets.get_row(rownum)
+                queue_position = row_data.get("QueuePosition", "?")
+            else:
+                queue_position = "?"
+
+        # Отправляем приватное сообщение пользователю
+        await interaction.followup.send(f"✅ Ваша заявка принята: {resource} x{qty}. Вы в очереди на позиции №{queue_position}.", ephemeral=True)
+
+        # Отправляем публичное уведомление в канал
+        embed = discord.Embed(
+            title="📋 Новая заявка в очереди",
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="👤 Игрок", value=f"{interaction.user.mention}", inline=True)
+        embed.add_field(name="🎮 Персонаж", value=character, inline=True)
+        embed_field_name = "🔵 Синий ресурс"
+        if grade.lower() == "purple":
+            embed_field_name = "🟣 Фиолетовый ресурс"
+        embed.add_field(name=embed_field_name, value=f"{resource} x{qty}", inline=False)
+        embed.add_field(name="📊 Позиция в очереди", value=f"№{queue_position}", inline=True)
+        embed.set_footer(text=f"ID заявки: {rowid[:8]}")
+
+        await interaction.channel.send(embed=embed)
+
+        # Очищаем сессию
+        if interaction.user.id in ACTIVE_SESSIONS:
+            del ACTIVE_SESSIONS[interaction.user.id]
 
     except Exception as e:
         logger.exception("process_blue_request error: %s", e)
         try:
-            await interaction.edit_original_response(content="Ошибка при добавлении заявки.")
+            await interaction.followup.send("Ошибка при добавлении заявки.", ephemeral=True)
         except Exception:
-            try:
-                await interaction.followup.send("Ошибка при добавлении заявки.", ephemeral=True)
-            except Exception:
-                await interaction.channel.send(f"{interaction.user.mention}, произошла ошибка при добавлении заявки.")
+            pass
 
-async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, user: discord.User, grade: str, resource: str, character: str, qty: int):
+        # Очищаем сессию при ошибке
+        if interaction.user.id in ACTIVE_SESSIONS:
+            del ACTIVE_SESSIONS[interaction.user.id]
+
+async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, user: discord.User, grade: str, resource: str, character: str, qty: int, session_id: str):
     def check(m: discord.Message):
         return m.author.id == user.id and m.channel.id == channel.id and (m.attachments or (m.content and m.content.lower() == 'отмена'))
 
+    screenshot_request_msg = None
+
     try:
+        # Отправляем сообщение только для этого пользователя
+        screenshot_request_msg = await channel.send(f"{user.mention}, пожалуйста, отправьте скриншот в течение 2 минут. Напишите 'отмена' чтобы отменить.")
+
         msg: discord.Message = await bot.wait_for('message', timeout=120.0, check=check)
     except asyncio.TimeoutError:
         try:
@@ -218,23 +297,44 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
         except Exception:
             pass
         finally:
-            ACTIVE_SESSIONS.pop(user.id, None)
+            # Удаляем сообщение с запросом скриншота
+            if screenshot_request_msg:
+                try:
+                    await screenshot_request_msg.delete()
+                except:
+                    pass
+            # Очищаем сессию
+            if user.id in ACTIVE_SESSIONS:
+                del ACTIVE_SESSIONS[user.id]
         return
+
+    # Удаляем сообщение с запросом скриншота
+    if screenshot_request_msg:
+        try:
+            await screenshot_request_msg.delete()
+        except:
+            pass
 
     if msg.content and msg.content.lower() == 'отмена':
         await channel.send(f"{user.mention}, запрос отменён.")
-        ACTIVE_SESSIONS.pop(user.id, None)
+        # Очищаем сессию
+        if user.id in ACTIVE_SESSIONS:
+            del ACTIVE_SESSIONS[user.id]
         return
 
     if not msg.attachments:
         await channel.send(f"{user.mention}, не найдено вложение. Повторите команду `!запрос`.")
-        ACTIVE_SESSIONS.pop(user.id, None)
+        # Очищаем сессию
+        if user.id in ACTIVE_SESSIONS:
+            del ACTIVE_SESSIONS[user.id]
         return
 
     attachment = msg.attachments[0]
     if not (attachment.content_type and attachment.content_type.startswith("image")):
         await channel.send(f"{user.mention}, приложите изображение.")
-        ACTIVE_SESSIONS.pop(user.id, None)
+        # Очищаем сессию
+        if user.id in ACTIVE_SESSIONS:
+            del ACTIVE_SESSIONS[user.id]
         return
 
     try:
@@ -242,16 +342,15 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
     except Exception as e:
         logger.exception("attachment.read failed: %s", e)
         await channel.send(f"{user.mention}, не удалось прочитать файл.")
-        ACTIVE_SESSIONS.pop(user.id, None)
+        # Очищаем сессию
+        if user.id in ACTIVE_SESSIONS:
+            del ACTIVE_SESSIONS[user.id]
         return
 
     try:
         # Используем локальный загрузчик для тестирования
         if hasattr(config, 'USE_LOCAL_UPLOADER') and config.USE_LOCAL_UPLOADER:
             # Сохраняем файл локально
-            import os
-            import uuid
-
             upload_dir = "uploads"
             os.makedirs(upload_dir, exist_ok=True)
 
@@ -275,7 +374,9 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
     except Exception as e:
         logger.exception("Upload failed: %s", e)
         await channel.send(f"{user.mention}, ошибка при загрузке скриншота.")
-        ACTIVE_SESSIONS.pop(user.id, None)
+        # Очищаем сессию
+        if user.id in ACTIVE_SESSIONS:
+            del ACTIVE_SESSIONS[user.id]
         return
 
     # append pending row
@@ -291,30 +392,54 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
             sheets.append_row(row)
             # do not recompute until approved (pending may be part of queue but priority handled)
 
+        # Удаляем сообщение пользователя со скриншотом
+        try:
+            await msg.delete()
+        except:
+            pass
+
         # Отправляем файл как вложение в Discord
         file = discord.File(io.BytesIO(content), filename=attachment.filename)
 
-        embed = discord.Embed(title="Новая фиолетовая заявка — требуется подтверждение", color=discord.Color.orange())
-        embed.add_field(name="Игрок", value=f"{user.mention}", inline=False)
-        embed.add_field(name="Ресурс", value=resource, inline=True)
-        embed.add_field(name="Кол-во", value=str(qty), inline=True)
-        embed.add_field(name="Персонаж", value=character, inline=False)
-        embed.add_field(name="Скрин", value=f"Сохранено: {drive_link}", inline=False)
+        embed = discord.Embed(
+            title="🟣 Новая фиолетовая заявка — требуется подтверждение",
+            color=discord.Color.purple(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="👤 Игрок", value=f"{user.mention}", inline=False)
+        embed.add_field(name="🎮 Персонаж", value=character, inline=True)
+        embed.add_field(name="📦 Ресурс", value=resource, inline=True)
+        embed.add_field(name="🔢 Количество", value=str(qty), inline=True)
+        embed.add_field(name="📎 Скриншот", value=drive_link, inline=False)
+        embed.set_footer(text=f"ID заявки: {rowid[:8]} • Нажмите ✅ для подтверждения")
 
         info_msg = await channel.send(
-            f"<@&{config.VERIFIER_ROLE_ID}> Пожалуйста подтвердите (реакция ✅).",
+            f"<@&{config.VERIFIER_ROLE_ID}> Пожалуйста подтвердите заявку:",
             embed=embed,
             file=file
         )
 
         await info_msg.add_reaction("✅")
-        PENDING_REQUESTS[info_msg.id] = {"row_uuid": rowid, "requester_id": user.id, "channel_id": channel.id, "drive_link": drive_link}
-        ACTIVE_SESSIONS.pop(user.id, None)
+        PENDING_REQUESTS[info_msg.id] = {
+            "row_uuid": rowid,
+            "requester_id": user.id,
+            "channel_id": channel.id,
+            "drive_link": drive_link,
+            "resource": resource,
+            "character": character,
+            "quantity": qty
+        }
+
+        # Очищаем сессию пользователя
+        if user.id in ACTIVE_SESSIONS:
+            del ACTIVE_SESSIONS[user.id]
 
     except Exception as e:
         logger.exception("register pending row failed: %s", e)
         await channel.send(f"{user.mention}, ошибка при регистрации заявки.")
-        ACTIVE_SESSIONS.pop(user.id, None)
+        # Очищаем сессию
+        if user.id in ACTIVE_SESSIONS:
+            del ACTIVE_SESSIONS[user.id]
 
 # ----- Команда запрос -----
 @bot.command(name="запрос")
@@ -323,26 +448,54 @@ async def cmd_request(ctx: commands.Context):
     try:
         # Проверяем, не находится ли пользователь уже в процессе создания заявки
         if ctx.author.id in ACTIVE_SESSIONS:
-            await ctx.send("У вас уже есть активная сессия создания заявки. Завершите ее или подождите.")
-            return
+            # Проверяем, не истекла ли старая сессия
+            session_data = ACTIVE_SESSIONS[ctx.author.id]
+            session_time = session_data.get("created_at", 0)
+            if asyncio.get_event_loop().time() - session_time > 120:
+                # Сессия истекла, удаляем
+                del ACTIVE_SESSIONS[ctx.author.id]
+            else:
+                await ctx.send("У вас уже есть активная сессия создания заявки. Завершите ее или подождите.", ephemeral=True)
+                return
 
-        # Отмечаем, что пользователь начал создание заявки
-        ACTIVE_SESSIONS[ctx.author.id] = True
+        # Создаем новую сессию
+        session_id = str(uuid.uuid4())
+        ACTIVE_SESSIONS[ctx.author.id] = {
+            "session_id": session_id,
+            "created_at": asyncio.get_event_loop().time(),
+            "channel_id": ctx.channel.id,
+            "user_id": ctx.author.id
+        }
 
-        # Создаем и отправляем меню выбора ресурса
-        view = ResourceSelect(author=ctx.author)
-        message = await ctx.send("Выберите ресурс для заявки:", view=view)
+        # Создаем и отправляем меню выбора ресурса (только для пользователя)
+        view = ResourceSelect(author=ctx.author, session_id=session_id)
+        message = await ctx.send("Выберите ресурс для заявки:", view=view, ephemeral=True)
 
-        # Ожидаем завершения выбора или таймаута
-        try:
-            await view.wait()
-        except Exception as e:
-            logger.exception("View wait error: %s", e)
+        # Сохраняем ID сообщения с меню для возможности удаления
+        ACTIVE_SESSIONS[ctx.author.id]["menu_message_id"] = message.id
+
+        # Запускаем таймер для автоматической очистки сессии
+        bot.loop.create_task(cleanup_session(ctx.author.id, session_id, message))
 
     except Exception as e:
         logger.exception("cmd_request error: %s", e)
-        ACTIVE_SESSIONS.pop(ctx.author.id, None)
-        await ctx.send("Произошла ошибка при создании заявки.")
+        if ctx.author.id in ACTIVE_SESSIONS:
+            del ACTIVE_SESSIONS[ctx.author.id]
+        await ctx.send("Произошла ошибка при создании заявки.", ephemeral=True)
+
+async def cleanup_session(user_id: int, session_id: str, menu_message: discord.Message):
+    """Очищает сессию через 120 секунд"""
+    await asyncio.sleep(120)
+
+    if user_id in ACTIVE_SESSIONS and ACTIVE_SESSIONS[user_id].get("session_id") == session_id:
+        try:
+            # Удаляем сообщение с меню
+            await menu_message.delete()
+        except:
+            pass
+
+        # Удаляем сессию
+        del ACTIVE_SESSIONS[user_id]
 
 @bot.event
 async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
@@ -366,20 +519,52 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
         if not meta:
             return
         row_uuid = meta.get("row_uuid")
+
         async with sheets_lock:
             rownum = sheets.get_row_number_by_rowid(row_uuid)
             if not rownum:
                 await msg.channel.send("Не удалось найти запись в таблице.")
                 return
             queue.approve_purple_request(rownum, approver_id=user.id)
-        # notify
+
+            # Получаем позицию в очереди
+            row_data = sheets.get_row(rownum)
+            queue_position = row_data.get("QueuePosition", "?")
+
+        # Отправляем уведомление о подтверждении
         requester = guild.get_member(meta.get("requester_id"))
-        await msg.channel.send(f"Заявка подтверждена {user.display_name}.")
+        resource = meta.get("resource")
+        character = meta.get("character")
+        quantity = meta.get("quantity")
+
+        # Уведомление в канал
+        embed = discord.Embed(
+            title="✅ Заявка подтверждена",
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="👤 Игрок", value=f"<@{meta.get('requester_id')}>", inline=True)
+        embed.add_field(name="🎮 Персонаж", value=character, inline=True)
+        embed.add_field(name="🟣 Ресурс", value=f"{resource} x{quantity}", inline=False)
+        embed.add_field(name="📊 Позиция в очереди", value=f"№{queue_position}", inline=True)
+        embed.add_field(name="👮 Подтвердил", value=user.display_name, inline=True)
+        embed.set_footer(text=f"ID заявки: {row_uuid[:8]}")
+
+        await msg.channel.send(embed=embed)
+
+        # Уведомление пользователю в ЛС
         if requester:
             try:
-                await requester.send("Ваша фиолетовая заявка подтверждена — вы добавлены в очередь.")
+                await requester.send(f"✅ Ваша фиолетовая заявка на {resource} x{quantity} подтверждена {user.display_name}. Вы в очереди на позиции №{queue_position}.")
             except Exception:
                 logger.debug("Cannot DM requester.")
+
+        # Удаляем сообщение с запросом на подтверждение
+        try:
+            await msg.delete()
+        except:
+            pass
+
         del PENDING_REQUESTS[msg.id]
     except Exception as e:
         logger.exception("on_reaction_add error: %s", e)
@@ -395,7 +580,8 @@ class StatusView(View):
             resource = req.get("ResourceName")
             qty = req.get("Quantity")
             status = req.get("Status")
-            label = f"{resource} x{qty} [{status}]"
+            queue_pos = req.get("QueuePosition", "?")
+            label = f"{resource} x{qty} [Поз.{queue_pos}]"
             # create cancel button per request
             btn = Button(label=label, style=discord.ButtonStyle.secondary, custom_id=f"cancel::{rownum}")
             btn.callback = self._make_callback(rownum)
@@ -424,36 +610,66 @@ class StatusView(View):
 async def cmd_status(ctx: commands.Context):
     try:
         init_adapters()
-        uid = str(ctx.author.id)
         # list_user_requests returns list with __row_number
         async with sheets_lock:
             requests = queue.list_user_requests(ctx.author.id)
         if not requests:
-            await ctx.send("У вас нет активных или ожидающих заявок.")
+            await ctx.send("У вас нет активных или ожидающих заявок.", ephemeral=True)
             return
+
+        # Сортируем заявки по статусу (сначала активные, затем pending)
+        requests.sort(key=lambda x: (0 if x.get("Status") == "active" else 1, x.get("QueuePosition", 999)))
+
         # Build message and view
-        lines = []
+        embed = discord.Embed(
+            title="📊 Ваши заявки",
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc)
+        )
+
+        active_requests = []
+        pending_requests = []
+
         for r in requests:
             resource = r.get("ResourceName")
             qty = r.get("Quantity")
             status = r.get("Status")
-            rownum = r.get("__row_number")
-            lines.append(f"Row {rownum}: {resource} x{qty} — Статус: {status}")
-        content = "Ваши заявки:\n" + "\n".join(lines)
+            queue_pos = r.get("QueuePosition", "?")
+            character = r.get("CharacterName", "?")
+            grade = r.get("ResourceGrade", "Blue")
+
+            status_text = "✅ Активна" if status == "active" else "⏳ Ожидает подтверждения"
+            grade_emoji = "🔵" if grade.lower() == "blue" else "🟣"
+
+            request_info = f"{grade_emoji} **{resource}** x{qty}\n"
+            request_info += f"👤 {character} | 📊 Поз. {queue_pos} | {status_text}\n"
+
+            if status == "active":
+                active_requests.append(request_info)
+            else:
+                pending_requests.append(request_info)
+
+        if active_requests:
+            embed.add_field(name="Активные заявки", value="\n".join(active_requests) or "Нет", inline=False)
+        if pending_requests:
+            embed.add_field(name="Ожидающие подтверждения", value="\n".join(pending_requests) or "Нет", inline=False)
+
+        embed.set_footer(text=f"Всего заявок: {len(requests)}")
+
         view = StatusView(user_id=ctx.author.id, requests=requests)
-        await ctx.send(content, view=view)
+        await ctx.send(embed=embed, view=view, ephemeral=True)
     except Exception as e:
         logger.exception("cmd_status error: %s", e)
-        await ctx.send("Ошибка при получении статуса.")
+        await ctx.send("Ошибка при получении статуса.", ephemeral=True)
 
 # Error handlers
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
-        await ctx.send("У вас нет прав для этой команды.")
+        await ctx.send("У вас нет прав для этой команды.", ephemeral=True)
         return
     logger.exception("Command error: %s", error)
-    await ctx.send("Произошла ошибка при выполнении команды.")
+    await ctx.send("Произошла ошибка при выполнении команды.", ephemeral=True)
 
 if __name__ == "__main__":
     import sys
