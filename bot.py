@@ -1,4 +1,3 @@
-# bot.py
 """
 StashKeeper main bot — UI-driven (Select + Modal).
 Includes extended !статус with cancel buttons.
@@ -32,6 +31,7 @@ sheets = None
 queue = None
 
 PENDING_REQUESTS: Dict[int, Dict[str, Any]] = {}
+ACTIVE_SESSIONS: Dict[int, bool] = {}  # user_id -> True если в процессе создания заявки
 sheets_lock = asyncio.Lock()
 
 BLUE_RESOURCES = [
@@ -52,8 +52,10 @@ PURPLE_RESOURCES = [
 ]
 ALL_RESOURCES = [("Blue", BLUE_RESOURCES), ("Purple", PURPLE_RESOURCES)]
 
+
 def is_verifier(member: discord.Member):
     return any(r.id == config.VERIFIER_ROLE_ID for r in member.roles)
+
 
 def init_adapters():
     global sheets, queue
@@ -62,10 +64,12 @@ def init_adapters():
     if queue is None:
         queue = QueueManager(sheets)
 
+
 @bot.event
 async def on_ready():
     logger.info("Bot ready: %s", bot.user)
     init_adapters()
+
 
 # ----- Admin commands -----
 @bot.command(name="start_stashkeep")
@@ -75,12 +79,14 @@ async def start_stashkeep(ctx, channel: discord.TextChannel = None):
     await target.send("StashKeeper активирован в этом канале. Используй команду `!запрос` для создания заявки.")
     await ctx.message.add_reaction("✅")
 
+
 @bot.command(name="stop_stashkeep")
 @commands.has_permissions(administrator=True)
 async def stop_stashkeep(ctx, channel: discord.TextChannel = None):
     target = channel or ctx.channel
     await target.send("StashKeeper отключён в этом канале.")
     await ctx.message.add_reaction("✅")
+
 
 # ----- UI flow -----
 class ResourceSelect(View):
@@ -92,8 +98,13 @@ class ResourceSelect(View):
             for res in lst:
                 label = f"{res} ({grade})"
                 options.append(discord.SelectOption(label=label, value=f"{grade}:::{res}"))
-        self.select = discord.ui.Select(placeholder="Выберите ресурс (грейд в скобках)", min_values=1, max_values=1, options=options)
+        self.select = discord.ui.Select(placeholder="Выберите ресурс (грейд в скобках)", min_values=1, max_values=1,
+                                        options=options)
         self.add_item(self.select)
+
+    async def on_timeout(self):
+        # Очищаем сессию при таймауте
+        ACTIVE_SESSIONS.pop(self.author.id, None)
 
     @discord.ui.select()
     async def select_callback(self, select: discord.ui.Select, interaction: discord.Interaction):
@@ -105,6 +116,7 @@ class ResourceSelect(View):
         modal = RequestModal(grade=grade, resource=resource, author=self.author)
         await interaction.response.send_modal(modal)
         self.stop()
+
 
 class RequestModal(Modal):
     def __init__(self, grade: str, resource: str, author: discord.Member):
@@ -118,6 +130,9 @@ class RequestModal(Modal):
         self.add_item(self.quantity)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Очищаем сессию при успешном отправлении
+        ACTIVE_SESSIONS.pop(interaction.user.id, None)
+
         try:
             qty = int(self.quantity.value.strip())
             if qty <= 0:
@@ -127,12 +142,25 @@ class RequestModal(Modal):
             return
 
         if self.grade.lower().startswith("purple"):
-            await interaction.response.send_message("Пожалуйста, отправьте в этот канал изображение (вложение). Напишите 'отмена' чтобы отменить. У вас 2 минуты.", ephemeral=False)
-            bot.loop.create_task(wait_for_screenshot_and_register(interaction.channel, interaction.user, self.grade, self.resource, self.character.value.strip(), qty))
+            await interaction.response.send_message(
+                "Пожалуйста, отправьте в этот канал изображение (вложение). Напишите 'отмена' чтобы отменить. У вас 2 минуты.",
+                ephemeral=False)
+            bot.loop.create_task(
+                wait_for_screenshot_and_register(interaction.channel, interaction.user, self.grade, self.resource,
+                                                 self.character.value.strip(), qty))
         else:
-            bot.loop.create_task(add_blue_request(interaction, interaction.user, self.grade, self.resource, self.character.value.strip(), qty))
+            bot.loop.create_task(
+                add_blue_request(interaction, interaction.user, self.grade, self.resource, self.character.value.strip(),
+                                 qty))
 
-async def add_blue_request(interaction: discord.Interaction, user: discord.User, grade: str, resource: str, character: str, qty: int):
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        # Очищаем сессию при ошибке
+        ACTIVE_SESSIONS.pop(interaction.user.id, None)
+        await super().on_error(interaction, error)
+
+
+async def add_blue_request(interaction: discord.Interaction, user: discord.User, grade: str, resource: str,
+                           character: str, qty: int):
     try:
         rowid = str(uuid.uuid4())
         now = __import__('datetime').datetime.utcnow().isoformat()
@@ -150,9 +178,13 @@ async def add_blue_request(interaction: discord.Interaction, user: discord.User,
         logger.exception("add_blue_request error: %s", e)
         await interaction.followup.send("Ошибка при добавлении заявки.", ephemeral=True)
 
-async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, user: discord.User, grade: str, resource: str, character: str, qty: int):
+
+async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, user: discord.User, grade: str,
+                                           resource: str, character: str, qty: int):
     def check(m: discord.Message):
-        return m.author.id == user.id and m.channel.id == channel.id and (m.attachments or (m.content and m.content.lower() == 'отмена'))
+        return m.author.id == user.id and m.channel.id == channel.id and (
+                    m.attachments or (m.content and m.content.lower() == 'отмена'))
+
     try:
         msg: discord.Message = await bot.wait_for('message', timeout=120.0, check=check)
     except asyncio.TimeoutError:
@@ -160,23 +192,34 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
             await channel.send(f"{user.mention}, время загрузки скриншота истекло. Запрос отменён.")
         except Exception:
             pass
+        finally:
+            ACTIVE_SESSIONS.pop(user.id, None)
         return
+
     if msg.content and msg.content.lower() == 'отмена':
         await channel.send(f"{user.mention}, запрос отменён.")
+        ACTIVE_SESSIONS.pop(user.id, None)
         return
+
     if not msg.attachments:
         await channel.send(f"{user.mention}, не найдено вложение. Повторите команду `!запрос`.")
+        ACTIVE_SESSIONS.pop(user.id, None)
         return
+
     attachment = msg.attachments[0]
     if not (attachment.content_type and attachment.content_type.startswith("image")):
         await channel.send(f"{user.mention}, приложите изображение.")
+        ACTIVE_SESSIONS.pop(user.id, None)
         return
+
     try:
         content = await attachment.read()
     except Exception as e:
         logger.exception("attachment.read failed: %s", e)
         await channel.send(f"{user.mention}, не удалось прочитать файл.")
+        ACTIVE_SESSIONS.pop(user.id, None)
         return
+
     loop = asyncio.get_event_loop()
     try:
         filename = f"{user.id}_{uuid.uuid4().hex}_{attachment.filename}"
@@ -184,7 +227,9 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
     except Exception as e:
         logger.exception("Drive upload failed: %s", e)
         await channel.send(f"{user.mention}, ошибка при загрузке скриншота.")
+        ACTIVE_SESSIONS.pop(user.id, None)
         return
+
     # append pending row
     try:
         rowid = str(uuid.uuid4())
@@ -205,10 +250,47 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
         embed.add_field(name="Скрин", value=drive_link, inline=False)
         info_msg = await channel.send(f"<@&{config.VERIFIER_ROLE_ID}> Пожалуйста подтвердите (реакция ✅).", embed=embed)
         await info_msg.add_reaction("✅")
-        PENDING_REQUESTS[info_msg.id] = {"row_uuid": rowid, "requester_id": user.id, "channel_id": channel.id, "drive_link": drive_link}
+        PENDING_REQUESTS[info_msg.id] = {"row_uuid": rowid, "requester_id": user.id, "channel_id": channel.id,
+                                         "drive_link": drive_link}
+        ACTIVE_SESSIONS.pop(user.id, None)
     except Exception as e:
         logger.exception("register pending row failed: %s", e)
         await channel.send(f"{user.mention}, ошибка при регистрации заявки.")
+        ACTIVE_SESSIONS.pop(user.id, None)
+
+
+# ----- Команда запрос -----
+@bot.command(name="запрос")
+async def cmd_request(ctx: commands.Context):
+    """Инициирует процесс создания заявки через меню выбора."""
+    try:
+        # Проверяем, не находится ли пользователь уже в процессе создания заявки
+        if ctx.author.id in ACTIVE_SESSIONS:
+            await ctx.send("У вас уже есть активная сессия создания заявки. Завершите ее или подождите.")
+            return
+
+        # Отмечаем, что пользователь начал создание заявки
+        ACTIVE_SESSIONS[ctx.author.id] = True
+
+        # Создаем и отправляем меню выбора ресурса
+        view = ResourceSelect(author=ctx.author)
+        message = await ctx.send("Выберите ресурс для заявки:", view=view)
+
+        # Ожидаем завершения выбора или таймаута
+        try:
+            await view.wait()
+        except Exception as e:
+            logger.exception("View wait error: %s", e)
+        finally:
+            # Удаляем пользователя из активных сессий через 2 минуты на всякий случай
+            await asyncio.sleep(120)
+            ACTIVE_SESSIONS.pop(ctx.author.id, None)
+
+    except Exception as e:
+        logger.exception("cmd_request error: %s", e)
+        ACTIVE_SESSIONS.pop(ctx.author.id, None)
+        await ctx.send("Произошла ошибка при создании заявки.")
+
 
 @bot.event
 async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
@@ -250,6 +332,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     except Exception as e:
         logger.exception("on_reaction_add error: %s", e)
 
+
 # ----- Extended !статус with cancel buttons -----
 class StatusView(View):
     def __init__(self, user_id: int, requests: list):
@@ -284,7 +367,9 @@ class StatusView(View):
             except Exception as e:
                 logger.exception("StatusView cancel callback error: %s", e)
                 await interaction.response.send_message("Ошибка при отмене заявки.", ephemeral=True)
+
         return callback
+
 
 @bot.command(name="статус")
 async def cmd_status(ctx: commands.Context):
@@ -312,6 +397,7 @@ async def cmd_status(ctx: commands.Context):
         logger.exception("cmd_status error: %s", e)
         await ctx.send("Ошибка при получении статуса.")
 
+
 # Error handlers
 @bot.event
 async def on_command_error(ctx, error):
@@ -321,8 +407,10 @@ async def on_command_error(ctx, error):
     logger.exception("Command error: %s", error)
     await ctx.send("Произошла ошибка при выполнении команды.")
 
+
 if __name__ == "__main__":
     import sys
+
     if not getattr(config, "DISCORD_TOKEN", None):
         logger.error("Set DISCORD_TOKEN in config.py")
         sys.exit(1)
