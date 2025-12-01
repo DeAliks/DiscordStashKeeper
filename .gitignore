@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+
+# PyCharm
+.idea/
+*.iml
+
+# Logs & runtime files
+*.log
+logs/
+*.sqlite
+*.db
+
+# Config files — приватные ключи !!!
+config.py
+credentials_template.json
+google_credentials.json
+*.token
+
+# Cache
+.cache/
+*.cache
+
+# OS files
+.DS_Store
+Thumbs.db
