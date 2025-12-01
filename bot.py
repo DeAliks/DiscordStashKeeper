@@ -18,6 +18,10 @@ from discord.ui import View, Select, Modal, TextInput, Button
 from sheets_adapter import SheetsAdapter
 from drive_uploader import upload_bytes
 from queue_manager import QueueManager
+from priority_manager import (
+    get_user_priority, set_multiple_users_priority, remove_multiple_users_priority,
+    get_all_priority_users, clear_all_priorities, HIGH_PRIORITY, DEFAULT_PRIORITY
+)
 import config
 
 logging.basicConfig(level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO))
@@ -86,12 +90,148 @@ async def stop_stashkeep(ctx, channel: discord.TextChannel = None):
     await target.send("StashKeeper отключён в этом канале.")
     await ctx.message.add_reaction("✅")
 
+# ----- Priority commands -----
+@bot.command(name="set_priority")
+@commands.has_permissions(administrator=True)
+async def cmd_set_priority(ctx: commands.Context, *members: discord.Member):
+    """Устанавливает высокий приоритет для указанных пользователей"""
+    try:
+        if not members:
+            await ctx.send("❌ Укажите пользователей через @упоминание.", ephemeral=True)
+            return
+
+        # Сохраняем сообщение команды для удаления
+        USER_COMMAND_MESSAGES[ctx.author.id] = ctx.message
+
+        user_ids = [str(member.id) for member in members]
+        set_multiple_users_priority(user_ids, HIGH_PRIORITY)
+
+        mentions = ", ".join([member.mention for member in members])
+        await ctx.send(f"✅ Установлен высокий приоритет для: {mentions}", ephemeral=True)
+
+        # Удаляем сообщение команды через 30 секунд
+        await asyncio.sleep(30)
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
+    except Exception as e:
+        logger.exception("cmd_set_priority error: %s", e)
+        await ctx.send("❌ Ошибка при установке приоритета.", ephemeral=True)
+
+@bot.command(name="remove_priority")
+@commands.has_permissions(administrator=True)
+async def cmd_remove_priority(ctx: commands.Context, *members: discord.Member):
+    """Удаляет высокий приоритет у указанных пользователей"""
+    try:
+        if not members:
+            await ctx.send("❌ Укажите пользователей через @упоминание.", ephemeral=True)
+            return
+
+        # Сохраняем сообщение команды для удаления
+        USER_COMMAND_MESSAGES[ctx.author.id] = ctx.message
+
+        user_ids = [str(member.id) for member in members]
+        remove_multiple_users_priority(user_ids)
+
+        mentions = ", ".join([member.mention for member in members])
+        await ctx.send(f"✅ Удален высокий приоритет у: {mentions}", ephemeral=True)
+
+        # Удаляем сообщение команды через 30 секунд
+        await asyncio.sleep(30)
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
+    except Exception as e:
+        logger.exception("cmd_remove_priority error: %s", e)
+        await ctx.send("❌ Ошибка при удалении приоритета.", ephemeral=True)
+
+@bot.command(name="list_priority")
+@commands.has_permissions(administrator=True)
+async def cmd_list_priority(ctx: commands.Context):
+    """Показывает всех пользователей с высоким приоритетом"""
+    try:
+        # Сохраняем сообщение команды для удаления
+        USER_COMMAND_MESSAGES[ctx.author.id] = ctx.message
+
+        priority_users = get_all_priority_users()
+
+        if not priority_users:
+            await ctx.send("📋 Нет пользователей с высоким приоритетом.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="👑 Пользователи с высоким приоритетом",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc)
+        )
+
+        for user_id, priority in priority_users.items():
+            member = ctx.guild.get_member(int(user_id))
+            if member:
+                embed.add_field(
+                    name=member.display_name,
+                    value=f"ID: {user_id} | Приоритет: {priority}",
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name=f"Неизвестный пользователь",
+                    value=f"ID: {user_id} | Приоритет: {priority}",
+                    inline=False
+                )
+
+        embed.set_footer(text=f"Всего: {len(priority_users)} пользователей")
+        await ctx.send(embed=embed, ephemeral=True)
+
+        # Удаляем сообщение команды через 30 секунд
+        await asyncio.sleep(30)
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
+    except Exception as e:
+        logger.exception("cmd_list_priority error: %s", e)
+        await ctx.send("❌ Ошибка при получении списка приоритетов.", ephemeral=True)
+
+@bot.command(name="clear_priority")
+@commands.has_permissions(administrator=True)
+async def cmd_clear_priority(ctx: commands.Context):
+    """Очищает все приоритеты"""
+    try:
+        # Сохраняем сообщение команды для удаления
+        USER_COMMAND_MESSAGES[ctx.author.id] = ctx.message
+
+        clear_all_priorities()
+        await ctx.send("✅ Все приоритеты очищены.", ephemeral=True)
+
+        # Удаляем сообщение команды через 30 секунд
+        await asyncio.sleep(30)
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
+    except Exception as e:
+        logger.exception("cmd_clear_priority error: %s", e)
+        await ctx.send("❌ Ошибка при очистке приоритетов.", ephemeral=True)
+
 # ----- UI flow -----
 class ResourceSelect(View):
     def __init__(self, author: discord.Member, session_id: str):
         super().__init__(timeout=120)
         self.author = author
         self.session_id = session_id
+
+        # Проверяем приоритет пользователя
+        user_priority = get_user_priority(str(author.id))
+        priority_info = ""
+        if user_priority > DEFAULT_PRIORITY:
+            priority_info = f" (Приоритет: {user_priority})"
 
         # Создаем опции для селекта
         options = []
@@ -103,7 +243,7 @@ class ResourceSelect(View):
 
         # Создаем селект
         select = Select(
-            placeholder="Выберите ресурс (грейд в скобках)",
+            placeholder=f"Выберите ресурс (грейд в скобках){priority_info}",
             min_values=1,
             max_values=1,
             options=options
@@ -242,12 +382,15 @@ async def process_blue_request(interaction: discord.Interaction, grade: str, res
             await interaction.followup.send("Ваша сессия истекла. Начните заново с `!запрос`.", ephemeral=True)
             return
 
+        # Получаем приоритет пользователя
+        user_priority = get_user_priority(str(interaction.user.id))
+
         rowid = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
         msg_id = interaction.message.id if interaction.message else 0
         row = [
             now, str(interaction.user.id), str(interaction.user), character, grade, resource,
-            str(qty), str(config.DEFAULT_PRIORITY), now, "", "active", str(interaction.channel.id),
+            str(qty), str(user_priority), now, "", "active", str(interaction.channel.id),
             str(msg_id), rowid, "", "n/a", "", ""
         ]
 
@@ -273,6 +416,11 @@ async def process_blue_request(interaction: discord.Interaction, grade: str, res
         embed.add_field(name="👤 Ваш персонаж", value=character, inline=True)
         embed.add_field(name="📊 Позиция в очереди", value=f"№{queue_position}", inline=True)
         embed.add_field(name="🎮 Статус", value="В очереди на выдачу", inline=False)
+
+        # Добавляем информацию о приоритете
+        if user_priority > DEFAULT_PRIORITY:
+            embed.add_field(name="👑 Приоритет", value=f"Уровень {user_priority}", inline=True)
+
         embed.set_footer(text=f"ID заявки: {rowid[:8]}")
 
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -287,6 +435,11 @@ async def process_blue_request(interaction: discord.Interaction, grade: str, res
         public_embed.add_field(name="🎮 Персонаж", value=character, inline=True)
         public_embed.add_field(name="🔵 Ресурс", value=f"{resource} x{qty}", inline=False)
         public_embed.add_field(name="📊 Позиция", value=f"№{queue_position}", inline=True)
+
+        # Добавляем иконку приоритета
+        if user_priority > DEFAULT_PRIORITY:
+            public_embed.add_field(name="👑 Приоритет", value=f"Уровень {user_priority}", inline=True)
+
         public_embed.set_footer(text=f"ID: {rowid[:8]}")
 
         public_msg = await interaction.channel.send(embed=public_embed)
@@ -414,11 +567,14 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
 
     # append pending row
     try:
+        # Получаем приоритет пользователя
+        user_priority = get_user_priority(str(user.id))
+
         rowid = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
         row = [
             now, str(user.id), str(user), character, "Purple", resource,
-            str(qty), str(config.DEFAULT_PRIORITY), now, "", "pending", str(channel.id),
+            str(qty), str(user_priority), now, "", "pending", str(channel.id),
             str(msg.id), rowid, drive_link, "awaiting", "", ""
         ]
         async with sheets_lock:
@@ -443,6 +599,11 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
         embed.add_field(name="🎮 Персонаж", value=character, inline=True)
         embed.add_field(name="📦 Ресурс", value=resource, inline=True)
         embed.add_field(name="🔢 Количество", value=str(qty), inline=True)
+
+        # Добавляем информацию о приоритете
+        if user_priority > DEFAULT_PRIORITY:
+            embed.add_field(name="👑 Приоритет", value=f"Уровень {user_priority}", inline=True)
+
         embed.add_field(name="📎 Скриншот", value=drive_link, inline=False)
         embed.set_footer(text=f"ID заявки: {rowid[:8]} • Нажмите ✅ для подтверждения")
 
@@ -579,6 +740,9 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
         character = meta.get("character")
         quantity = meta.get("quantity")
 
+        # Получаем приоритет пользователя
+        user_priority = get_user_priority(str(meta.get("requester_id")))
+
         # Уведомление в канал (удаляем через 30 секунд)
         embed = discord.Embed(
             title="✅ Заявка подтверждена",
@@ -589,6 +753,11 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
         embed.add_field(name="🎮 Персонаж", value=character, inline=True)
         embed.add_field(name="🟣 Ресурс", value=f"{resource} x{quantity}", inline=False)
         embed.add_field(name="📊 Позиция в очереди", value=f"№{queue_position}", inline=True)
+
+        # Добавляем информацию о приоритете
+        if user_priority > DEFAULT_PRIORITY:
+            embed.add_field(name="👑 Приоритет", value=f"Уровень {user_priority}", inline=True)
+
         embed.add_field(name="👮 Подтвердил", value=user.display_name, inline=True)
         embed.set_footer(text=f"ID заявки: {row_uuid[:8]}")
 
@@ -641,7 +810,14 @@ class StatusView(View):
             qty = req.get("Quantity")
             status = req.get("Status")
             queue_pos = req.get("QueuePosition", "?")
-            label = f"{resource} x{qty} [Поз.{queue_pos}]"
+            priority = req.get("PriorityLevel", "1")
+
+            # Добавляем иконку приоритета
+            priority_icon = ""
+            if int(priority) > DEFAULT_PRIORITY:
+                priority_icon = "👑 "
+
+            label = f"{priority_icon}{resource} x{qty} [Поз.{queue_pos}]"
             # create cancel button per request
             btn = Button(label=label, style=discord.ButtonStyle.secondary, custom_id=f"cancel::{rownum}")
             btn.callback = self._make_callback(rownum)
@@ -701,12 +877,16 @@ async def cmd_status(ctx: commands.Context):
             queue_pos = r.get("QueuePosition", "?")
             character = r.get("CharacterName", "?")
             grade = r.get("ResourceGrade", "Blue")
+            priority = int(r.get("PriorityLevel", "1"))
 
             status_text = "✅ Активна" if status == "active" else "⏳ Ожидает подтверждения"
             grade_emoji = "🔵" if grade.lower() == "blue" else "🟣"
+            priority_icon = "👑 " if priority > DEFAULT_PRIORITY else ""
 
-            request_info = f"{grade_emoji} **{resource}** x{qty}\n"
+            request_info = f"{priority_icon}{grade_emoji} **{resource}** x{qty}\n"
             request_info += f"👤 {character} | 📊 Поз. {queue_pos} | {status_text}\n"
+            if priority > DEFAULT_PRIORITY:
+                request_info += f"👑 Приоритет: {priority}\n"
 
             if status == "active":
                 active_requests.append(request_info)
@@ -717,6 +897,15 @@ async def cmd_status(ctx: commands.Context):
             embed.add_field(name="Активные заявки", value="\n".join(active_requests) or "Нет", inline=False)
         if pending_requests:
             embed.add_field(name="Ожидающие подтверждения", value="\n".join(pending_requests) or "Нет", inline=False)
+
+        # Проверяем приоритет пользователя
+        user_priority = get_user_priority(str(ctx.author.id))
+        if user_priority > DEFAULT_PRIORITY:
+            embed.add_field(
+                name="👑 Ваш приоритет",
+                value=f"Уровень {user_priority}. Ваши заявки обрабатываются в первую очередь.",
+                inline=False
+            )
 
         embed.set_footer(text=f"Всего заявок: {len(requests)}")
 
@@ -762,13 +951,14 @@ async def cmd_queue(ctx: commands.Context, resource_name: str = None):
                 resources_dict[resource] = []
             resources_dict[resource].append(req)
 
-        # Сортируем каждый ресурс по позиции в очереди
+        # Сортируем каждый ресурс по позиции в очереди (сначала по приоритету, потом по времени)
         for resource, requests in resources_dict.items():
-            requests.sort(key=lambda x: int(x.get("QueuePosition", 999) or 999))
+            requests.sort(key=lambda x: (-int(x.get("PriorityLevel", 1)), int(x.get("QueuePosition", 999) or 999)))
 
         # Создаем embed
         embed = discord.Embed(
             title="📋 Текущая очередь заявок",
+            description="👑 - приоритетные игроки",
             color=discord.Color.gold(),
             timestamp=datetime.now(timezone.utc)
         )
@@ -780,9 +970,13 @@ async def cmd_queue(ctx: commands.Context, resource_name: str = None):
                 character = req.get("CharacterName", "Неизвестно")
                 qty = req.get("Quantity", "?")
                 pos = req.get("QueuePosition", "?")
+                priority = int(req.get("PriorityLevel", "1"))
                 status = "⏳" if req.get("Status") == "pending" else "✅"
 
-                queue_text += f"{pos}. {status} {player} ({character}) - x{qty}\n"
+                # Добавляем иконку приоритета
+                priority_icon = "👑 " if priority > DEFAULT_PRIORITY else ""
+
+                queue_text += f"{pos}. {priority_icon}{status} {player} ({character}) - x{qty}\n"
 
             if len(requests) > 10:
                 queue_text += f"... и еще {len(requests) - 10} заявок"
@@ -816,7 +1010,6 @@ async def on_command_error(ctx, error):
         return
     logger.exception("Command error: %s", error)
     await ctx.send("Произошла ошибка при выполнении команды.", ephemeral=True)
-
 
 if __name__ == "__main__":
     import sys

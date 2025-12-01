@@ -24,7 +24,7 @@ class QueueManager:
                       qty: int, channel_id: int, message_id: int, screenshot_url: str = "", priority: int = None,
                       status: str = "active", purple_approval: str = "n/a") -> List[str]:
         if priority is None:
-            priority = config.DEFAULT_PRIORITY
+            priority = config.DEFAULT_PRIORITY  # Используем значение из конфига
         row_uuid = str(uuid.uuid4())
         now = self._now_iso()
         row = [
