@@ -6,6 +6,7 @@ Includes extended !статус with cancel buttons.
 import asyncio
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Dict, Any
 
 import discord
@@ -158,30 +159,51 @@ class RequestModal(Modal):
             await interaction.response.send_message("Пожалуйста, отправьте в этот канал изображение (вложение). Напишите 'отмена' чтобы отменить. У вас 2 минуты.", ephemeral=False)
             bot.loop.create_task(wait_for_screenshot_and_register(interaction.channel, interaction.user, self.grade, self.resource, self.character.value.strip(), qty))
         else:
-            bot.loop.create_task(add_blue_request(interaction, interaction.user, self.grade, self.resource, self.character.value.strip(), qty))
+            # Отправляем начальный ответ и создаем задачу
+            await interaction.response.send_message("Обрабатываю ваш запрос...", ephemeral=True)
+            bot.loop.create_task(process_blue_request(interaction, self.grade, self.resource, self.character.value.strip(), qty))
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         # Очищаем сессию при ошибке
         ACTIVE_SESSIONS.pop(interaction.user.id, None)
         await super().on_error(interaction, error)
 
-async def add_blue_request(interaction: discord.Interaction, user: discord.User, grade: str, resource: str, character: str, qty: int):
+async def process_blue_request(interaction: discord.Interaction, grade: str, resource: str, character: str, qty: int):
+    """Обрабатывает запрос на синий ресурс в фоновом режиме"""
     try:
         rowid = str(uuid.uuid4())
-        now = __import__('datetime').datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         msg_id = interaction.message.id if interaction.message else 0
         row = [
-            now, str(user.id), str(user), character, grade, resource,
+            now, str(interaction.user.id), str(interaction.user), character, grade, resource,
             str(qty), str(config.DEFAULT_PRIORITY), now, "", "active", str(interaction.channel.id),
             str(msg_id), rowid, "", "n/a", "", ""
         ]
         async with sheets_lock:
             sheets.append_row(row)
             sheets.recompute_queue_positions(resource)
-        await interaction.followup.send(f"Заявка принята: {resource} x{qty}.", ephemeral=True)
+
+        # Редактируем исходное сообщение с результатом
+        try:
+            await interaction.edit_original_response(content=f"Заявка принята: {resource} x{qty}.")
+        except Exception as e:
+            logger.warning("Не удалось отредактировать сообщение: %s", e)
+            # Пробуем отправить новое сообщение
+            try:
+                await interaction.followup.send(f"Заявка принята: {resource} x{qty}.", ephemeral=True)
+            except Exception:
+                # Если и это не работает, отправляем в канал
+                await interaction.channel.send(f"{interaction.user.mention}, ваша заявка принята: {resource} x{qty}.")
+
     except Exception as e:
-        logger.exception("add_blue_request error: %s", e)
-        await interaction.followup.send("Ошибка при добавлении заявки.", ephemeral=True)
+        logger.exception("process_blue_request error: %s", e)
+        try:
+            await interaction.edit_original_response(content="Ошибка при добавлении заявки.")
+        except Exception:
+            try:
+                await interaction.followup.send("Ошибка при добавлении заявки.", ephemeral=True)
+            except Exception:
+                await interaction.channel.send(f"{interaction.user.mention}, произошла ошибка при добавлении заявки.")
 
 async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, user: discord.User, grade: str, resource: str, character: str, qty: int):
     def check(m: discord.Message):
@@ -234,7 +256,7 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
     # append pending row
     try:
         rowid = str(uuid.uuid4())
-        now = __import__('datetime').datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         row = [
             now, str(user.id), str(user), character, "Purple", resource,
             str(qty), str(config.DEFAULT_PRIORITY), now, "", "pending", str(channel.id),
