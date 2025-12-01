@@ -9,7 +9,7 @@ import uuid
 import io
 import os
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 import discord
 from discord.ext import commands
@@ -34,7 +34,8 @@ sheets = None
 queue = None
 
 PENDING_REQUESTS: Dict[int, Dict[str, Any]] = {}
-ACTIVE_SESSIONS: Dict[int, Dict[str, Any]] = {}  # user_id -> session data (для отслеживания активных сессий)
+ACTIVE_SESSIONS: Dict[int, Dict[str, Any]] = {}  # user_id -> session data
+USER_COMMAND_MESSAGES: Dict[int, discord.Message] = {}  # user_id -> command message to delete
 sheets_lock = asyncio.Lock()
 
 BLUE_RESOURCES = [
@@ -161,7 +162,19 @@ class RequestModal(Modal):
         self.resource = resource
         self.author = author
         self.session_id = session_id
-        self.character = TextInput(label="Имя персонажа", placeholder="Например: Ivan")
+
+        # Для фиолетовых ресурсов используем ник пользователя по умолчанию
+        default_character = ""
+        if grade.lower().startswith("purple"):
+            # Берем ник без дискриминатора (части после #)
+            default_character = author.name
+
+        self.character = TextInput(
+            label="Имя персонажа",
+            placeholder=f"Например: {author.name}",
+            default=default_character if default_character else None,
+            max_length=32
+        )
         self.quantity = TextInput(label="Количество", placeholder="Число, например 1", max_length=6)
         self.add_item(self.character)
         self.add_item(self.quantity)
@@ -180,12 +193,17 @@ class RequestModal(Modal):
             await interaction.response.send_message("Неверное количество.", ephemeral=True)
             return
 
+        # Если имя персонажа пустое, используем ник пользователя
+        character_name = self.character.value.strip()
+        if not character_name:
+            character_name = interaction.user.name
+
         if self.grade.lower().startswith("purple"):
             # Сохраняем данные заявки в сессию
             ACTIVE_SESSIONS[interaction.user.id]["request_data"] = {
                 "grade": self.grade,
                 "resource": self.resource,
-                "character": self.character.value.strip(),
+                "character": character_name,
                 "qty": qty
             }
 
@@ -201,14 +219,14 @@ class RequestModal(Modal):
                 interaction.user,
                 self.grade,
                 self.resource,
-                self.character.value.strip(),
+                character_name,
                 qty,
                 self.session_id
             ))
         else:
             # Отправляем начальный ответ и создаем задачу для синих ресурсов
             await interaction.response.defer(ephemeral=True)
-            bot.loop.create_task(process_blue_request(interaction, self.grade, self.resource, self.character.value.strip(), qty, self.session_id))
+            bot.loop.create_task(process_blue_request(interaction, self.grade, self.resource, character_name, qty, self.session_id))
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         # Очищаем сессию при ошибке
@@ -246,24 +264,39 @@ async def process_blue_request(interaction: discord.Interaction, grade: str, res
                 queue_position = "?"
 
         # Отправляем приватное сообщение пользователю
-        await interaction.followup.send(f"✅ Ваша заявка принята: {resource} x{qty}. Вы в очереди на позиции №{queue_position}.", ephemeral=True)
+        embed = discord.Embed(
+            title="✅ Заявка принята",
+            description=f"**{resource}** x{qty}",
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="👤 Ваш персонаж", value=character, inline=True)
+        embed.add_field(name="📊 Позиция в очереди", value=f"№{queue_position}", inline=True)
+        embed.add_field(name="🎮 Статус", value="В очереди на выдачу", inline=False)
+        embed.set_footer(text=f"ID заявки: {rowid[:8]}")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
         # Отправляем публичное уведомление в канал
-        embed = discord.Embed(
+        public_embed = discord.Embed(
             title="📋 Новая заявка в очереди",
             color=discord.Color.blue(),
             timestamp=datetime.now(timezone.utc)
         )
-        embed.add_field(name="👤 Игрок", value=f"{interaction.user.mention}", inline=True)
-        embed.add_field(name="🎮 Персонаж", value=character, inline=True)
-        embed_field_name = "🔵 Синий ресурс"
-        if grade.lower() == "purple":
-            embed_field_name = "🟣 Фиолетовый ресурс"
-        embed.add_field(name=embed_field_name, value=f"{resource} x{qty}", inline=False)
-        embed.add_field(name="📊 Позиция в очереди", value=f"№{queue_position}", inline=True)
-        embed.set_footer(text=f"ID заявки: {rowid[:8]}")
+        public_embed.add_field(name="👤 Игрок", value=f"{interaction.user.mention}", inline=True)
+        public_embed.add_field(name="🎮 Персонаж", value=character, inline=True)
+        public_embed.add_field(name="🔵 Ресурс", value=f"{resource} x{qty}", inline=False)
+        public_embed.add_field(name="📊 Позиция", value=f"№{queue_position}", inline=True)
+        public_embed.set_footer(text=f"ID: {rowid[:8]}")
 
-        await interaction.channel.send(embed=embed)
+        public_msg = await interaction.channel.send(embed=public_embed)
+
+        # Удаляем публичное сообщение через 30 секунд
+        await asyncio.sleep(30)
+        try:
+            await public_msg.delete()
+        except:
+            pass
 
         # Очищаем сессию
         if interaction.user.id in ACTIVE_SESSIONS:
@@ -446,6 +479,9 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
 async def cmd_request(ctx: commands.Context):
     """Инициирует процесс создания заявки через меню выбора."""
     try:
+        # Сохраняем сообщение команды для удаления
+        USER_COMMAND_MESSAGES[ctx.author.id] = ctx.message
+
         # Проверяем, не находится ли пользователь уже в процессе создания заявки
         if ctx.author.id in ACTIVE_SESSIONS:
             # Проверяем, не истекла ли старая сессия
@@ -475,7 +511,7 @@ async def cmd_request(ctx: commands.Context):
         ACTIVE_SESSIONS[ctx.author.id]["menu_message_id"] = message.id
 
         # Запускаем таймер для автоматической очистки сессии
-        bot.loop.create_task(cleanup_session(ctx.author.id, session_id, message))
+        bot.loop.create_task(cleanup_session(ctx.author.id, session_id, message, ctx.message))
 
     except Exception as e:
         logger.exception("cmd_request error: %s", e)
@@ -483,7 +519,7 @@ async def cmd_request(ctx: commands.Context):
             del ACTIVE_SESSIONS[ctx.author.id]
         await ctx.send("Произошла ошибка при создании заявки.", ephemeral=True)
 
-async def cleanup_session(user_id: int, session_id: str, menu_message: discord.Message):
+async def cleanup_session(user_id: int, session_id: str, menu_message: discord.Message, command_message: discord.Message):
     """Очищает сессию через 120 секунд"""
     await asyncio.sleep(120)
 
@@ -491,6 +527,12 @@ async def cleanup_session(user_id: int, session_id: str, menu_message: discord.M
         try:
             # Удаляем сообщение с меню
             await menu_message.delete()
+        except:
+            pass
+
+        # Удаляем сообщение команды
+        try:
+            await command_message.delete()
         except:
             pass
 
@@ -537,7 +579,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
         character = meta.get("character")
         quantity = meta.get("quantity")
 
-        # Уведомление в канал
+        # Уведомление в канал (удаляем через 30 секунд)
         embed = discord.Embed(
             title="✅ Заявка подтверждена",
             color=discord.Color.green(),
@@ -550,18 +592,36 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
         embed.add_field(name="👮 Подтвердил", value=user.display_name, inline=True)
         embed.set_footer(text=f"ID заявки: {row_uuid[:8]}")
 
-        await msg.channel.send(embed=embed)
+        notification_msg = await msg.channel.send(embed=embed)
 
         # Уведомление пользователю в ЛС
         if requester:
             try:
-                await requester.send(f"✅ Ваша фиолетовая заявка на {resource} x{quantity} подтверждена {user.display_name}. Вы в очереди на позиции №{queue_position}.")
+                user_embed = discord.Embed(
+                    title="✅ Ваша заявка подтверждена",
+                    description=f"**{resource}** x{quantity}",
+                    color=discord.Color.green(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                user_embed.add_field(name="👮 Подтвердил", value=user.display_name, inline=True)
+                user_embed.add_field(name="📊 Позиция в очереди", value=f"№{queue_position}", inline=True)
+                user_embed.add_field(name="🎮 Статус", value="В очереди на выдачу", inline=False)
+                user_embed.set_footer(text=f"ID заявки: {row_uuid[:8]}")
+
+                await requester.send(embed=user_embed)
             except Exception:
                 logger.debug("Cannot DM requester.")
 
         # Удаляем сообщение с запросом на подтверждение
         try:
             await msg.delete()
+        except:
+            pass
+
+        # Удаляем уведомление в канале через 30 секунд
+        await asyncio.sleep(30)
+        try:
+            await notification_msg.delete()
         except:
             pass
 
@@ -608,7 +668,11 @@ class StatusView(View):
 
 @bot.command(name="статус")
 async def cmd_status(ctx: commands.Context):
+    """Показывает статус заявок пользователя."""
     try:
+        # Сохраняем сообщение команды для удаления
+        USER_COMMAND_MESSAGES[ctx.author.id] = ctx.message
+
         init_adapters()
         # list_user_requests returns list with __row_number
         async with sheets_lock:
@@ -657,10 +721,92 @@ async def cmd_status(ctx: commands.Context):
         embed.set_footer(text=f"Всего заявок: {len(requests)}")
 
         view = StatusView(user_id=ctx.author.id, requests=requests)
-        await ctx.send(embed=embed, view=view, ephemeral=True)
+        status_msg = await ctx.send(embed=embed, view=view, ephemeral=True)
+
+        # Удаляем сообщение команды через 120 секунд
+        await asyncio.sleep(120)
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
     except Exception as e:
         logger.exception("cmd_status error: %s", e)
         await ctx.send("Ошибка при получении статуса.", ephemeral=True)
+
+# ----- Команда для просмотра очереди -----
+@bot.command(name="очередь")
+async def cmd_queue(ctx: commands.Context, resource_name: str = None):
+    """Показывает текущую очередь по ресурсам."""
+    try:
+        init_adapters()
+        async with sheets_lock:
+            all_requests = sheets.get_all_records()
+
+        # Фильтруем активные заявки
+        active_requests = [r for r in all_requests if r.get("Status") in ("active", "pending")]
+
+        if resource_name:
+            # Фильтруем по конкретному ресурсу
+            active_requests = [r for r in active_requests if r.get("ResourceName", "").lower() == resource_name.lower()]
+
+        if not active_requests:
+            await ctx.send(f"Нет активных заявок{f' на ресурс {resource_name}' if resource_name else ''}.", ephemeral=True)
+            return
+
+        # Группируем по ресурсам
+        resources_dict = {}
+        for req in active_requests:
+            resource = req.get("ResourceName")
+            if resource not in resources_dict:
+                resources_dict[resource] = []
+            resources_dict[resource].append(req)
+
+        # Сортируем каждый ресурс по позиции в очереди
+        for resource, requests in resources_dict.items():
+            requests.sort(key=lambda x: int(x.get("QueuePosition", 999) or 999))
+
+        # Создаем embed
+        embed = discord.Embed(
+            title="📋 Текущая очередь заявок",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc)
+        )
+
+        for resource, requests in list(resources_dict.items())[:10]:  # Ограничиваем 10 ресурсами
+            queue_text = ""
+            for i, req in enumerate(requests[:10]):  # Ограничиваем 10 заявками на ресурс
+                player = req.get("DiscordName", "Неизвестно")
+                character = req.get("CharacterName", "Неизвестно")
+                qty = req.get("Quantity", "?")
+                pos = req.get("QueuePosition", "?")
+                status = "⏳" if req.get("Status") == "pending" else "✅"
+
+                queue_text += f"{pos}. {status} {player} ({character}) - x{qty}\n"
+
+            if len(requests) > 10:
+                queue_text += f"... и еще {len(requests) - 10} заявок"
+
+            if not queue_text:
+                queue_text = "Нет заявок"
+
+            embed.add_field(name=f"**{resource}**", value=queue_text, inline=False)
+
+        if len(resources_dict) > 10:
+            embed.set_footer(text=f"Показано 10 из {len(resources_dict)} ресурсов. Уточните запрос.")
+
+        await ctx.send(embed=embed, ephemeral=True)
+
+        # Удаляем сообщение команды через 120 секунд
+        await asyncio.sleep(120)
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
+    except Exception as e:
+        logger.exception("cmd_queue error: %s", e)
+        await ctx.send("Ошибка при получении информации об очереди.", ephemeral=True)
 
 # Error handlers
 @bot.event
