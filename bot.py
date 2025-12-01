@@ -817,6 +817,7 @@ async def on_command_error(ctx, error):
     logger.exception("Command error: %s", error)
     await ctx.send("Произошла ошибка при выполнении команды.", ephemeral=True)
 
+
 if __name__ == "__main__":
     import sys
     if not getattr(config, "DISCORD_TOKEN", None):
