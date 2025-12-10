@@ -137,36 +137,40 @@ class SheetsAdapter:
                 logger.exception("update_row update_cell error for row %s col %s: %s", row_number, col_idx, e)
                 raise
 
-    def get_row(self, row_number: int) -> Dict[str, Any]:
-        """
-        Return a dict of header->value for the given 1-based row_number.
-        """
-        headers = self.get_headers()
+    def get_row(self, row_number: int) -> Optional[Dict[str, Any]]:
+        """Получить строку по номеру."""
         try:
+            # === ДОБАВЛЕНА ПРОВЕРКА НА НЕВАЛИДНЫЙ НОМЕР СТРОКИ ===
+            if row_number is None:
+                logger.error("get_row вызван с row_number=None")
+                return None
+            if not isinstance(row_number, int) or row_number < 1:
+                logger.error(f"Неверный номер строки: {row_number} (тип: {type(row_number)})")
+                return None
+            # === КОНЕЦ ПРОВЕРКИ ===
+
             values = self.sheet.row_values(row_number)
+            if not values:
+                return None
+
+            headers = self.sheet.row_values(1)
+            row_dict = {}
+            for i, header in enumerate(headers):
+                if i < len(values):
+                    row_dict[header] = values[i]
+                else:
+                    row_dict[header] = ""
+
+            # Добавляем номер строки в возвращаемый словарь
+            row_dict['__row_number'] = row_number
+
+            return row_dict
+        except gspread.exceptions.APIError as e:
+            logger.exception(f"get_row API error: {e}")
+            return None
         except Exception as e:
-            logger.exception("get_row error: %s", e)
-            raise
-        row = {}
-        for idx, header in enumerate(headers):
-            val = values[idx] if idx < len(values) else ""
-            row[header] = val
-
-        # Преобразуем числовые поля в int
-        numeric_fields = ["Quantity", "IssuedQuantity", "Remaining", "PriorityLevel"]
-        for field in numeric_fields:
-            if field in row and row[field]:
-                try:
-                    row[field] = int(row[field])
-                except ValueError:
-                    row[field] = 0
-            else:
-                row[field] = 0
-
-        # Добавляем номер строки для удобства
-        row["__row_number"] = row_number
-        return row
-
+            logger.exception(f"get_row error: {e}")
+            return None
     # ---- Utility: recompute queue positions for a given resource ----
     def recompute_queue_positions(self, resource_name: str):
         """

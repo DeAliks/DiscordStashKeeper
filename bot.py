@@ -975,16 +975,24 @@ class IssueQuantityModal(Modal):
     async def _issue_quantity(self, interaction: discord.Interaction, row_number: int, quantity: int):
         """Выдать указанное количество"""
         try:
-            row = sheets.get_row(row_number)
-            if not row:
+            # === ДОБАВЛЕНА ПРОВЕРКА НА НЕВАЛИДНЫЙ НОМЕР СТРОКИ ===
+            if row_number is None:
                 await interaction.response.send_message(
-                    "❌ Заявка не найдена.",
+                    "❌ Ошибка: не удалось определить номер строки заявки. Пожалуйста, выберите заявку заново.",
                     ephemeral=True
                 )
                 return
 
-            current_issued = row.get("IssuedQuantity", 0)
-            total = row.get("Quantity", 0)
+            row = sheets.get_row(row_number)
+            if not row:
+                await interaction.response.send_message(
+                    "❌ Заявка не найдена в таблице.",
+                    ephemeral=True
+                )
+                return
+
+            current_issued = int(row.get("IssuedQuantity", 0) or 0)
+            total = int(row.get("Quantity", 0) or 0)
 
             new_issued = min(current_issued + quantity, total)
 
@@ -1045,10 +1053,9 @@ class IssueQuantityModal(Modal):
         except Exception as e:
             logger.exception(f"Error issuing quantity: {e}")
             await interaction.response.send_message(
-                "❌ Произошла ошибка.",
+                "❌ Произошла ошибка при выдаче ресурсов.",
                 ephemeral=True
             )
-
     async def _refresh_queue_view(self, interaction: discord.Interaction):
         """Обновить представление очереди"""
         try:
@@ -1114,6 +1121,14 @@ class UnissueQuantityModal(Modal):
     async def _unissue_quantity(self, interaction: discord.Interaction, row_number: int, quantity: int):
         """Вернуть указанное количество"""
         try:
+            # === ДОБАВЛЕНА ПРОВЕРКА НА НЕВАЛИДНЫЙ НОМЕР СТРОКИ ===
+            if row_number is None:
+                await interaction.response.send_message(
+                    "❌ Ошибка: не удалось определить номер строки заявки.",
+                    ephemeral=True
+                )
+                return
+
             row = sheets.get_row(row_number)
             if not row:
                 await interaction.response.send_message(
@@ -1122,7 +1137,7 @@ class UnissueQuantityModal(Modal):
                 )
                 return
 
-            current_issued = row.get("IssuedQuantity", 0)
+            current_issued = int(row.get("IssuedQuantity", 0) or 0)
             new_issued = max(0, current_issued - quantity)
 
             # Update in database
@@ -1150,7 +1165,6 @@ class UnissueQuantityModal(Modal):
                 "❌ Произошла ошибка.",
                 ephemeral=True
             )
-
     async def _refresh_queue_view(self, interaction: discord.Interaction):
         """Обновить представление очереди"""
         try:
@@ -1263,17 +1277,34 @@ class RequestActionView(View):
         super().__init__(timeout=300)
         self.request = request
         self.all_requests = all_requests
+
+        # === УЛУЧШЕННОЕ ПОЛУЧЕНИЕ НОМЕРА СТРОКИ ===
         self.row_number = request.get("__row_number")
-        self.remaining = request.get("Remaining", 0)
-        self.issued = request.get("IssuedQuantity", 0)
-        self.total = request.get("Quantity", 0)
+        if self.row_number is None:
+            # Пробуем получить номер строки из других полей
+            self.row_number = request.get("RowNumber") or request.get("row_number")
+
+        self.remaining = int(request.get("Remaining", 0) or 0)
+        self.issued = int(request.get("IssuedQuantity", 0) or 0)
+        self.total = int(request.get("Quantity", 0) or 0)
         self.resource = request.get("ResourceName", "Unknown")
         self.player = request.get("DiscordName", "Unknown")
+
+        # Логирование для отладки
+        logger.info(f"RequestActionView создан: row_number={self.row_number}, resource={self.resource}")
 
     @button(label="➕ Выдать", style=discord.ButtonStyle.primary, row=0)
     async def issue_button(self, interaction: discord.Interaction, button: Button):
         if self.remaining <= 0:
             await interaction.response.send_message("❌ Нечего выдавать - заявка уже выполнена.", ephemeral=True)
+            return
+
+        # === ПРОВЕРКА НАЛИЧИЯ НОМЕРА СТРОКИ ===
+        if self.row_number is None:
+            await interaction.response.send_message(
+                "❌ Ошибка: не удалось определить номер строки заявки. Пожалуйста, выберите другую заявку.",
+                ephemeral=True
+            )
             return
 
         modal = IssueQuantityModal(
@@ -1290,6 +1321,14 @@ class RequestActionView(View):
             await interaction.response.send_message("❌ Нечего возвращать.", ephemeral=True)
             return
 
+        # === ПРОВЕРКА НАЛИЧИЯ НОМЕРА СТРОКИ ===
+        if self.row_number is None:
+            await interaction.response.send_message(
+                "❌ Ошибка: не удалось определить номер строки заявки. Пожалуйста, выберите другую заявку.",
+                ephemeral=True
+            )
+            return
+
         modal = UnissueQuantityModal(
             self.row_number,
             self.resource,
@@ -1301,6 +1340,14 @@ class RequestActionView(View):
     @button(label="✅ Завершить", style=discord.ButtonStyle.green, row=1)
     async def complete_button(self, interaction: discord.Interaction, button: Button):
         try:
+            # === ПРОВЕРКА НАЛИЧИЯ НОМЕРА СТРОКИ ===
+            if self.row_number is None:
+                await interaction.response.send_message(
+                    "❌ Ошибка: не удалось определить номер строки заявки.",
+                    ephemeral=True
+                )
+                return
+
             success = sheets.complete_request(self.row_number)
             if success:
                 await interaction.response.send_message(
@@ -1317,6 +1364,14 @@ class RequestActionView(View):
 
     @button(label="❌ Отменить", style=discord.ButtonStyle.danger, row=1)
     async def cancel_button(self, interaction: discord.Interaction, button: Button):
+        # === ПРОВЕРКА НАЛИЧИЯ НОМЕРА СТРОКИ ===
+        if self.row_number is None:
+            await interaction.response.send_message(
+                "❌ Ошибка: не удалось определить номер строки заявки.",
+                ephemeral=True
+            )
+            return
+
         confirm_view = ConfirmCancelView(self.row_number, self.all_requests)
         await interaction.response.send_message(
             "⚠️ Подтвердите отмену заявки:",
@@ -1376,7 +1431,6 @@ class RequestActionView(View):
         except Exception as e:
             logger.exception(f"Error refreshing queue view: {e}")
             await interaction.response.send_message("❌ Ошибка при обновлении списка.", ephemeral=True)
-
 # ----- Команда для просмотра и управления очередью -----
 class QueueManagementView(View):
     """View for managing requests in queue."""
@@ -1523,6 +1577,7 @@ class QueueManagementView(View):
 
         return embed
 
+
 class ConfirmCancelView(View):
     """Confirmation view for request cancellation."""
 
@@ -1534,6 +1589,14 @@ class ConfirmCancelView(View):
     @button(label="✅ Да, отменить", style=discord.ButtonStyle.danger)
     async def confirm_button(self, interaction: discord.Interaction, button: Button):
         try:
+            # === ПРОВЕРКА НАЛИЧИЯ НОМЕРА СТРОКИ ===
+            if self.row_number is None:
+                await interaction.response.send_message(
+                    "❌ Ошибка: не удалось определить номер строки заявки.",
+                    ephemeral=True
+                )
+                return
+
             # Cancel request via queue manager
             async with sheets_lock:
                 queue.cancel_request_by_row(self.row_number, requester_id=interaction.user.id)
