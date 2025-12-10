@@ -1328,7 +1328,7 @@ class RequestActionView(View):
     async def back_button(self, interaction: discord.Interaction, button: Button):
         # Get updated list of requests
         active_requests = sheets.get_active_requests()
-        queue_view = QueueSelectView(active_requests)
+        queue_view = QueueManagementView(active_requests)
 
         embed = discord.Embed(
             title="📋 Управление очередью заявок",
@@ -1368,28 +1368,16 @@ class RequestActionView(View):
         try:
             # Get updated list of requests
             active_requests = sheets.get_active_requests()
-            queue_view = QueueSelectView(active_requests)
+            queue_view = QueueManagementView(active_requests)
 
-            embed = discord.Embed(
-                title="📋 Управление очередью заявок",
-                description="Выберите заявку для управления из списка ниже",
-                color=discord.Color.gold(),
-                timestamp=datetime.now(timezone.utc)
-            )
-
-            if active_requests:
-                embed.add_field(
-                    name="Доступные заявки",
-                    value=f"{len(active_requests)} активных заявок",
-                    inline=False
-                )
+            embed = queue_view._create_embed()
 
             await interaction.response.edit_message(embed=embed, view=queue_view)
         except Exception as e:
             logger.exception(f"Error refreshing queue view: {e}")
             await interaction.response.send_message("❌ Ошибка при обновлении списка.", ephemeral=True)
 
-
+# ----- Команда для просмотра и управления очередью -----
 class QueueManagementView(View):
     """View for managing requests in queue."""
 
@@ -1399,8 +1387,7 @@ class QueueManagementView(View):
 
         # Create select dropdown
         options = []
-        for req in requests[:25]:  # Discord limit
-            row_num = req.get("__row_number", "?")
+        for i, req in enumerate(requests[:25]):  # Discord limit
             resource = req.get("ResourceName", "Unknown")[:50]
             player = req.get("DiscordName", "Unknown")[:20]
             position = req.get("QueuePosition", "?")
@@ -1413,7 +1400,7 @@ class QueueManagementView(View):
             options.append(discord.SelectOption(
                 label=label[:100],
                 description=description[:100],
-                value=str(row_num)
+                value=str(i)  # Используем индекс как уникальное значение
             ))
 
         if options:
@@ -1427,18 +1414,15 @@ class QueueManagementView(View):
             self.add_item(select)
 
     async def select_callback(self, interaction: discord.Interaction):
-        selected_row_num = int(self.children[0].values[0])
+        selected_index = int(self.children[0].values[0])
 
-        # Find the request
-        selected_req = None
-        for req in self.requests:
-            if req.get("__row_number") == selected_row_num:
-                selected_req = req
-                break
-
-        if not selected_req:
-            await interaction.response.send_message("Заявка не найдена.", ephemeral=True)
+        # Check if index is valid
+        if selected_index < 0 or selected_index >= len(self.requests):
+            await interaction.response.send_message("Ошибка: неверный индекс заявки.", ephemeral=True)
             return
+
+        # Get the selected request
+        selected_req = self.requests[selected_index]
 
         # Create action buttons view
         action_view = RequestActionView(selected_req, self.requests)
@@ -1464,6 +1448,7 @@ class QueueManagementView(View):
         remaining = req.get("Remaining", total)
         position = req.get("QueuePosition", "?")
         priority = req.get("PriorityLevel", 1)
+        row_number = req.get("__row_number", "?")
 
         embed.add_field(name="Ресурс", value=resource, inline=True)
         embed.add_field(name="Игрок", value=player, inline=True)
@@ -1476,7 +1461,7 @@ class QueueManagementView(View):
         if int(priority) > DEFAULT_PRIORITY:
             embed.add_field(name="Приоритет", value=f"👑 Уровень {priority}", inline=True)
 
-        embed.set_footer(text=f"ID заявки: {req.get('__row_number', '?')}")
+        embed.set_footer(text=f"ID строки: {row_number}")
 
         return embed
 
@@ -1537,7 +1522,6 @@ class QueueManagementView(View):
         embed.set_footer(text=f"Всего активных заявок: {len(self.requests)}")
 
         return embed
-
 
 class ConfirmCancelView(View):
     """Confirmation view for request cancellation."""
@@ -1622,7 +1606,6 @@ class ConfirmCancelView(View):
                         break
         except Exception as e:
             logger.exception(f"Error refreshing original queue view: {e}")
-
 @bot.command(name="очередь")
 async def cmd_queue(ctx: commands.Context, resource_name: str = None):
     """Показывает текущую очередь заявок с возможностью управления."""
