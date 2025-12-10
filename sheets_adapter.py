@@ -140,14 +140,12 @@ class SheetsAdapter:
     def get_row(self, row_number: int) -> Optional[Dict[str, Any]]:
         """Получить строку по номеру."""
         try:
-            # === ДОБАВЛЕНА ПРОВЕРКА НА НЕВАЛИДНЫЙ НОМЕР СТРОКИ ===
             if row_number is None:
                 logger.error("get_row вызван с row_number=None")
                 return None
             if not isinstance(row_number, int) or row_number < 1:
                 logger.error(f"Неверный номер строки: {row_number} (тип: {type(row_number)})")
                 return None
-            # === КОНЕЦ ПРОВЕРКИ ===
 
             values = self.sheet.row_values(row_number)
             if not values:
@@ -161,8 +159,19 @@ class SheetsAdapter:
                 else:
                     row_dict[header] = ""
 
-            # Добавляем номер строки в возвращаемый словарь
+            # Добавляем номер строки
             row_dict['__row_number'] = row_number
+
+            # Добавляем числовые версии полей для удобства
+            try:
+                row_dict['Quantity_int'] = int(row_dict.get('Quantity', '0')) if row_dict.get('Quantity') else 0
+                row_dict['IssuedQuantity_int'] = int(row_dict.get('IssuedQuantity', '0')) if row_dict.get(
+                    'IssuedQuantity') else 0
+                row_dict['Remaining_int'] = int(row_dict.get('Remaining', '0')) if row_dict.get('Remaining') else 0
+                row_dict['PriorityLevel_int'] = int(row_dict.get('PriorityLevel', '1')) if row_dict.get(
+                    'PriorityLevel') else 1
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Ошибка преобразования числовых полей в строке {row_number}: {e}")
 
             return row_dict
         except gspread.exceptions.APIError as e:
@@ -328,7 +337,8 @@ class SheetsAdapter:
             if not row:
                 return False
 
-            total_quantity = row.get("Quantity", 0)
+            # Используем числовую версию
+            total_quantity = row.get('Quantity_int', 0)
 
             # Calculate remaining
             remaining = max(0, total_quantity - issued_quantity)
@@ -352,6 +362,7 @@ class SheetsAdapter:
                 if resource:
                     self.recompute_queue_positions(resource)
 
+            logger.info(f"Обновлена заявка #{row_number}: выдано {issued_quantity}, осталось {remaining}")
             return True
         except Exception as e:
             logger.exception("update_issued_quantity error: %s", e)
@@ -364,12 +375,21 @@ class SheetsAdapter:
             if not row:
                 return False
 
+            # Получаем Quantity и конвертируем в число
+            total_quantity_str = row.get("Quantity", "0")
+            try:
+                total_quantity = int(total_quantity_str) if total_quantity_str else 0
+            except (ValueError, TypeError):
+                logger.error(f"Не удалось преобразовать Quantity в число: {total_quantity_str}")
+                total_quantity = 0
+
             updates = {
                 "Status": "completed",
                 "QueuePosition": "",
-                "IssuedQuantity": str(row.get("Quantity", 0)),
+                "IssuedQuantity": str(total_quantity),
                 "Remaining": "0"
             }
+
             self.update_row(row_number, updates)
 
             # Recompute queue positions for the resource
@@ -377,6 +397,7 @@ class SheetsAdapter:
             if resource:
                 self.recompute_queue_positions(resource)
 
+            logger.info(f"Заявка #{row_number} завершена")
             return True
         except Exception as e:
             logger.exception("complete_request error: %s", e)
