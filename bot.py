@@ -1,6 +1,6 @@
 """
 StashKeeper main bot — UI-driven (Select + Modal).
-Includes extended !статус with cancel buttons.
+Includes extended !статус with cancel buttons and queue management.
 """
 
 import asyncio
@@ -9,11 +9,12 @@ import uuid
 import io
 import os
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 import discord
+import self
 from discord.ext import commands
-from discord.ui import View, Select, Modal, TextInput, Button
+from discord.ui import View, Select, Modal, TextInput, Button, button
 
 from sheets_adapter import SheetsAdapter
 from drive_uploader import upload_bytes
@@ -390,7 +391,7 @@ async def process_blue_request(interaction: discord.Interaction, grade: str, res
         msg_id = interaction.message.id if interaction.message else 0
         row = [
             now, str(interaction.user.id), str(interaction.user), character, grade, resource,
-            str(qty), str(user_priority), now, "", "active", str(interaction.channel.id),
+            str(qty), "0", str(qty), str(user_priority), now, "", "active", str(interaction.channel.id),
             str(msg_id), rowid, "", "n/a", "", ""
         ]
 
@@ -574,7 +575,7 @@ async def wait_for_screenshot_and_register(channel: discord.abc.Messageable, use
         now = datetime.now(timezone.utc).isoformat()
         row = [
             now, str(user.id), str(user), character, "Purple", resource,
-            str(qty), str(user_priority), now, "", "pending", str(channel.id),
+            str(qty), "0", str(qty), str(user_priority), now, "", "pending", str(channel.id),
             str(msg.id), rowid, drive_link, "awaiting", "", ""
         ]
         async with sheets_lock:
@@ -878,6 +879,8 @@ async def cmd_status(ctx: commands.Context):
             character = r.get("CharacterName", "?")
             grade = r.get("ResourceGrade", "Blue")
             priority = int(r.get("PriorityLevel", "1"))
+            issued = r.get("IssuedQuantity", 0)
+            remaining = r.get("Remaining", qty)
 
             status_text = "✅ Активна" if status == "active" else "⏳ Ожидает подтверждения"
             grade_emoji = "🔵" if grade.lower() == "blue" else "🟣"
@@ -885,6 +888,8 @@ async def cmd_status(ctx: commands.Context):
 
             request_info = f"{priority_icon}{grade_emoji} **{resource}** x{qty}\n"
             request_info += f"👤 {character} | 📊 Поз. {queue_pos} | {status_text}\n"
+            if issued > 0:
+                request_info += f"📦 Выдано: {issued}/{qty} (осталось: {remaining})\n"
             if priority > DEFAULT_PRIORITY:
                 request_info += f"👑 Приоритет: {priority}\n"
 
@@ -923,75 +928,717 @@ async def cmd_status(ctx: commands.Context):
         logger.exception("cmd_status error: %s", e)
         await ctx.send("Ошибка при получении статуса.", ephemeral=True)
 
-# ----- Команда для просмотра очереди -----
-@bot.command(name="очередь")
-async def cmd_queue(ctx: commands.Context, resource_name: str = None):
-    """Показывает текущую очередь по ресурсам."""
-    try:
-        init_adapters()
-        async with sheets_lock:
-            all_requests = sheets.get_all_records()
+# ----- Модальные окна для управления заявками -----
+class IssueQuantityModal(Modal):
+    """Модальное окно для выдачи произвольного количества"""
 
-        # Фильтруем активные заявки
-        active_requests = [r for r in all_requests if r.get("Status") in ("active", "pending")]
+    def __init__(self, row_number: int, resource: str, player: str, max_quantity: int):
+        super().__init__(title=f"Выдать ресурс: {resource}")
+        self.row_number = row_number
+        self.resource = resource
+        self.player = player
+        self.max_quantity = max_quantity
 
-        if resource_name:
-            # Фильтруем по конкретному ресурсу
-            active_requests = [r for r in active_requests if r.get("ResourceName", "").lower() == resource_name.lower()]
+        self.quantity = TextInput(
+            label="Количество для выдачи",
+            placeholder=f"Введите число от 1 до {max_quantity}",
+            default=str(max_quantity) if max_quantity <= 10 else "10",
+            max_length=10
+        )
+        self.add_item(self.quantity)
 
-        if not active_requests:
-            await ctx.send(f"Нет активных заявок{f' на ресурс {resource_name}' if resource_name else ''}.", ephemeral=True)
-            return
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            qty = int(self.quantity.value.strip())
+            if qty <= 0 or qty > self.max_quantity:
+                await interaction.response.send_message(
+                    f"❌ Неверное количество. Введите число от 1 до {self.max_quantity}.",
+                    ephemeral=True
+                )
+                return
 
-        # Группируем по ресурсам
-        resources_dict = {}
-        for req in active_requests:
-            resource = req.get("ResourceName")
-            if resource not in resources_dict:
-                resources_dict[resource] = []
-            resources_dict[resource].append(req)
+            # Выдаем указанное количество
+            await self._issue_quantity(interaction, self.row_number, qty)
 
-        # Сортируем каждый ресурс по позиции в очереди (сначала по приоритету, потом по времени)
-        for resource, requests in resources_dict.items():
-            requests.sort(key=lambda x: (-int(x.get("PriorityLevel", 1)), int(x.get("QueuePosition", 999) or 999)))
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Введите корректное число.",
+                ephemeral=True
+            )
+        except Exception as e:
+            logger.exception(f"Error in IssueQuantityModal: {e}")
+            await interaction.response.send_message(
+                "❌ Произошла ошибка при обработке запроса.",
+                ephemeral=True
+            )
 
-        # Создаем embed
+    async def _issue_quantity(self, interaction: discord.Interaction, row_number: int, quantity: int):
+        """Выдать указанное количество"""
+        try:
+            row = sheets.get_row(row_number)
+            if not row:
+                await interaction.response.send_message(
+                    "❌ Заявка не найдена.",
+                    ephemeral=True
+                )
+                return
+
+            current_issued = row.get("IssuedQuantity", 0)
+            total = row.get("Quantity", 0)
+
+            new_issued = min(current_issued + quantity, total)
+
+            # Update in database
+            completed = (new_issued >= total)
+            success = sheets.update_issued_quantity(
+                row_number,
+                new_issued,
+                completed=completed
+            )
+
+            if success:
+                # Send success message
+                remaining = total - new_issued
+
+                if completed:
+                    message = f"✅ Заявка #{row_number} полностью выполнена!\n"
+                    message += f"**Ресурс:** {row.get('ResourceName')}\n"
+                    message += f"**Игрок:** {row.get('DiscordName')}\n"
+                    message += f"**Выдано:** {new_issued}/{total}"
+
+                    # Notify player
+                    player_id = row.get("DiscordID")
+                    if player_id:
+                        try:
+                            guild = interaction.guild
+                            member = guild.get_member(int(player_id))
+                            if member:
+                                embed = discord.Embed(
+                                    title="🎉 Ваша заявка выполнена!",
+                                    description=f"**{row.get('ResourceName')}** x{total}",
+                                    color=discord.Color.green(),
+                                    timestamp=datetime.now(timezone.utc)
+                                )
+                                embed.add_field(name="👮 Выдал", value=interaction.user.display_name, inline=True)
+                                embed.add_field(name="📦 Количество", value=f"{total} единиц", inline=True)
+                                embed.set_footer(text=f"ID заявки: {row.get('RowID', '')[:8]}")
+
+                                await member.send(embed=embed)
+                        except Exception:
+                            logger.debug("Could not DM player")
+                else:
+                    message = f"✅ Выдано {quantity} единиц для заявки #{row_number}\n"
+                    message += f"**Ресурс:** {row.get('ResourceName')}\n"
+                    message += f"**Игрок:** {row.get('DiscordName')}\n"
+                    message += f"**Прогресс:** {new_issued}/{total} (осталось: {remaining})"
+
+                await interaction.response.send_message(message, ephemeral=True)
+
+                # Update queue view
+                await self._refresh_queue_view(interaction)
+            else:
+                await interaction.response.send_message(
+                    "❌ Ошибка при обновлении заявки.",
+                    ephemeral=True
+                )
+
+        except Exception as e:
+            logger.exception(f"Error issuing quantity: {e}")
+            await interaction.response.send_message(
+                "❌ Произошла ошибка.",
+                ephemeral=True
+            )
+
+    async def _refresh_queue_view(self, interaction: discord.Interaction):
+        """Обновить представление очереди"""
+        try:
+            # Найти оригинальное сообщение с очередью и обновить его
+            channel = interaction.channel
+            async for message in channel.history(limit=50):
+                if message.author == bot.user and message.embeds:
+                    if "Управление очередью" in message.embeds[0].title:
+                        # Get updated active requests
+                        active_requests = sheets.get_active_requests()
+
+                        # Recreate view
+                        new_view = QueueManagementView(active_requests, page=0)
+
+                        # Update message
+                        await message.edit(view=new_view)
+                        break
+        except Exception as e:
+            logger.exception(f"Error refreshing queue view: {e}")
+
+class UnissueQuantityModal(Modal):
+    """Модальное окно для возврата произвольного количества"""
+
+    def __init__(self, row_number: int, resource: str, player: str, max_quantity: int):
+        super().__init__(title=f"Вернуть ресурс: {resource}")
+        self.row_number = row_number
+        self.resource = resource
+        self.player = player
+        self.max_quantity = max_quantity
+
+        self.quantity = TextInput(
+            label="Количество для возврата",
+            placeholder=f"Введите число от 1 до {max_quantity}",
+            default="1",
+            max_length=10
+        )
+        self.add_item(self.quantity)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            qty = int(self.quantity.value.strip())
+            if qty <= 0 or qty > self.max_quantity:
+                await interaction.response.send_message(
+                    f"❌ Неверное количество. Введите число от 1 до {self.max_quantity}.",
+                    ephemeral=True
+                )
+                return
+
+            # Возвращаем указанное количество
+            await self._unissue_quantity(interaction, self.row_number, qty)
+
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Введите корректное число.",
+                ephemeral=True
+            )
+        except Exception as e:
+            logger.exception(f"Error in UnissueQuantityModal: {e}")
+            await interaction.response.send_message(
+                "❌ Произошла ошибка при обработке запроса.",
+                ephemeral=True
+            )
+
+    async def _unissue_quantity(self, interaction: discord.Interaction, row_number: int, quantity: int):
+        """Вернуть указанное количество"""
+        try:
+            row = sheets.get_row(row_number)
+            if not row:
+                await interaction.response.send_message(
+                    "❌ Заявка не найдена.",
+                    ephemeral=True
+                )
+                return
+
+            current_issued = row.get("IssuedQuantity", 0)
+            new_issued = max(0, current_issued - quantity)
+
+            # Update in database
+            success = sheets.update_issued_quantity(row_number, new_issued)
+
+            if success:
+                message = f"↩️ Возвращено {quantity} единиц для заявки #{row_number}\n"
+                message += f"**Ресурс:** {row.get('ResourceName')}\n"
+                message += f"**Игрок:** {row.get('DiscordName')}\n"
+                message += f"**Текущий прогресс:** {new_issued}/{row.get('Quantity', 0)}"
+
+                await interaction.response.send_message(message, ephemeral=True)
+
+                # Update queue view
+                await self._refresh_queue_view(interaction)
+            else:
+                await interaction.response.send_message(
+                    "❌ Ошибка при обновлении заявки.",
+                    ephemeral=True
+                )
+
+        except Exception as e:
+            logger.exception(f"Error unissuing quantity: {e}")
+            await interaction.response.send_message(
+                "❌ Произошла ошибка.",
+                ephemeral=True
+            )
+
+    async def _refresh_queue_view(self, interaction: discord.Interaction):
+        """Обновить представление очереди"""
+        try:
+            # Найти оригинальное сообщение с очередью и обновить его
+            channel = interaction.channel
+            async for message in channel.history(limit=50):
+                if message.author == bot.user and message.embeds:
+                    if "Управление очередью" in message.embeds[0].title:
+                        # Get updated active requests
+                        active_requests = sheets.get_active_requests()
+
+                        # Recreate view
+                        new_view = QueueManagementView(active_requests, page=0)
+
+                        # Update message
+                        await message.edit(view=new_view)
+                        break
+        except Exception as e:
+            logger.exception(f"Error refreshing queue view: {e}")
+
+# ----- Команда для просмотра и управления очередью -----
+class QueueManagementView(View):
+    """View for managing requests in queue."""
+
+    def __init__(self, requests: List[Dict[str, Any]], page: int = 0):
+        super().__init__(timeout=300)  # 5 минут на управление
+        self.requests = requests
+        self.page = page
+        self.items_per_page = 5
+
+        # Calculate pages
+        self.total_pages = (len(requests) + self.items_per_page - 1) // self.items_per_page
+
+        # Add navigation buttons if needed
+        if self.total_pages > 1:
+            self.add_item(PreviousButton())
+            self.add_item(NextButton())
+
+        # Add request management buttons for current page
+        self._add_request_buttons()
+
+    def _add_request_buttons(self):
+        """Add buttons for requests on current page."""
+        start_idx = self.page * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, len(self.requests))
+
+        for i in range(start_idx, end_idx):
+            req = self.requests[i]
+            row_num = req.get("__row_number")
+            resource = req.get("ResourceName", "Unknown")
+            player = req.get("DiscordName", "Unknown")
+            character = req.get("CharacterName", "Unknown")
+            issued = req.get("IssuedQuantity", 0)
+            total = req.get("Quantity", 0)
+            remaining = req.get("Remaining", total)
+
+            # Создаем кнопки для управления заявкой
+            button_view = RequestButtonView(row_num, resource, player, character, issued, total, remaining)
+            self.add_item(button_view)
+
+    def _create_embed(self) -> discord.Embed:
+        """Create embed for current page."""
+        start_idx = self.page * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, len(self.requests))
+
         embed = discord.Embed(
-            title="📋 Текущая очередь заявок",
-            description="👑 - приоритетные игроки",
+            title="📋 Управление очередью заявок",
+            description="Используйте кнопки для выдачи ресурсов",
             color=discord.Color.gold(),
             timestamp=datetime.now(timezone.utc)
         )
 
-        for resource, requests in list(resources_dict.items())[:10]:  # Ограничиваем 10 ресурсами
-            queue_text = ""
-            for i, req in enumerate(requests[:10]):  # Ограничиваем 10 заявками на ресурс
-                player = req.get("DiscordName", "Неизвестно")
-                character = req.get("CharacterName", "Неизвестно")
-                qty = req.get("Quantity", "?")
-                pos = req.get("QueuePosition", "?")
-                priority = int(req.get("PriorityLevel", "1"))
-                status = "⏳" if req.get("Status") == "pending" else "✅"
+        if not self.requests:
+            embed.description = "Нет активных заявок для управления."
+            return embed
 
-                # Добавляем иконку приоритета
-                priority_icon = "👑 " if priority > DEFAULT_PRIORITY else ""
+        for i in range(start_idx, end_idx):
+            req = self.requests[i]
+            resource = req.get("ResourceName", "Unknown")
+            player = req.get("DiscordName", "Unknown")
+            character = req.get("CharacterName", "Unknown")
+            total = req.get("Quantity", 0)
+            issued = req.get("IssuedQuantity", 0)
+            remaining = req.get("Remaining", total)
+            position = req.get("QueuePosition", "?")
+            priority = req.get("PriorityLevel", 1)
 
-                queue_text += f"{pos}. {priority_icon}{status} {player} ({character}) - x{qty}\n"
+            # Create field value
+            field_value = f"**Игрок:** {player}\n"
+            field_value += f"**Персонаж:** {character}\n"
+            field_value += f"**Заказано:** {total} | **Выдано:** {issued} | **Осталось:** {remaining}\n"
+            field_value += f"**Позиция:** #{position}"
 
-            if len(requests) > 10:
-                queue_text += f"... и еще {len(requests) - 10} заявок"
+            if int(priority) > DEFAULT_PRIORITY:
+                field_value += f" | 👑 Приоритет {priority}"
 
-            if not queue_text:
-                queue_text = "Нет заявок"
+            embed.add_field(
+                name=f"📦 {resource} (ID: {req.get('__row_number')})",
+                value=field_value,
+                inline=False
+            )
 
-            embed.add_field(name=f"**{resource}**", value=queue_text, inline=False)
+        embed.set_footer(text=f"Страница {self.page + 1}/{self.total_pages} | Всего заявок: {len(self.requests)}")
+        return embed
 
-        if len(resources_dict) > 10:
-            embed.set_footer(text=f"Показано 10 из {len(resources_dict)} ресурсов. Уточните запрос.")
+class PreviousButton(Button):
+    def __init__(self):
+        super().__init__(label="⬅️ Назад", style=discord.ButtonStyle.secondary)
 
-        await ctx.send(embed=embed, ephemeral=True)
+    async def callback(self, interaction: discord.Interaction):
+        view: QueueManagementView = self.view
+        if view.page > 0:
+            view.page -= 1
 
-        # Удаляем сообщение команды через 120 секунд
+            # Обновляем сообщение
+            embed = view._create_embed()
+            await interaction.response.edit_message(embed=embed, view=view)
+
+class NextButton(Button):
+    def __init__(self):
+        super().__init__(label="➡️ Вперед", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: QueueManagementView = self.view
+        if view.page < view.total_pages - 1:
+            view.page += 1
+
+            # Обновляем сообщение
+            embed = view._create_embed()
+            await interaction.response.edit_message(embed=embed, view=view)
+
+class RequestButtonView(View):
+    """Кнопки для управления конкретной заявкой"""
+
+    def __init__(self, row_number: int, resource: str, player: str, character: str, issued: int, total: int, remaining: int):
+        super().__init__(timeout=300)
+        self.row_number = row_number
+        self.resource = resource
+        self.player = player
+        self.character = character
+        self.issued = issued
+        self.total = total
+        self.remaining = remaining
+
+    """@button(label="➕ Выдать 1", style=discord.ButtonStyle.success, row=0)
+    async def issue_one_button(self, interaction: discord.Interaction, button: Button):
+        await self._issue_quantity(interaction, 1)
+    
+    @button(label="➕ Выдать 5", style=discord.ButtonStyle.success, row=0)
+    async def issue_five_button(self, interaction: discord.Interaction, button: Button):
+        await self._issue_quantity(interaction, 5)
+    
+    @button(label="➕ Выдать 10", style=discord.ButtonStyle.success, row=0)
+    async def issue_ten_button(self, interaction: discord.Interaction, button: Button):
+        await self._issue_quantity(interaction, 10)
+    """
+    @button(label="➕ Выдать", style=discord.ButtonStyle.primary, row=0)
+    async def issue_custom_button(self, interaction: discord.Interaction, button: Button):
+        # Открываем модальное окно для ввода произвольного количества
+        modal = IssueQuantityModal(self.row_number, self.resource, self.player, self.remaining)
+        await interaction.response.send_modal(modal)
+    """
+    @button(label="➖ Вернуть 1", style=discord.ButtonStyle.secondary, row=1, disabled=(self.issued <= 0))
+    async def unissue_one_button(self, interaction: discord.Interaction, button: Button):
+        await self._unissue_quantity(interaction, 1)
+ 
+    @button(label="➖ Произвольное", style=discord.ButtonStyle.secondary, row=1, disabled=(self.issued <= 0))
+    async def unissue_custom_button(self, interaction: discord.Interaction, button: Button):
+        # Открываем модальное окно для возврата произвольного количества
+        modal = UnissueQuantityModal(self.row_number, self.resource, self.player, self.issued)
+        await interaction.response.send_modal(modal)
+
+    """
+    @button(label="✅ Завершить", style=discord.ButtonStyle.green, row=2)
+    async def complete_button(self, interaction: discord.Interaction, button: Button):
+        await self._complete_request(interaction)
+
+    @button(label="❌ Отменить", style=discord.ButtonStyle.danger, row=2)
+    async def cancel_button(self, interaction: discord.Interaction, button: Button):
+        await self._cancel_request(interaction)
+
+    async def _issue_quantity(self, interaction: discord.Interaction, quantity: int):
+        """Выдать указанное количество"""
+        try:
+            # Проверяем, что количество не превышает оставшееся
+            if quantity > self.remaining:
+                await interaction.response.send_message(
+                    f"❌ Нельзя выдать {quantity}, осталось только {self.remaining}.",
+                    ephemeral=True
+                )
+                return
+
+            # Выдаем указанное количество
+            new_issued = self.issued + quantity
+            completed = (new_issued >= self.total)
+
+            # Update in database
+            success = sheets.update_issued_quantity(
+                self.row_number,
+                new_issued,
+                completed=completed
+            )
+
+            if success:
+                # Send success message
+                remaining = self.total - new_issued
+
+                if completed:
+                    message = f"✅ Заявка #{self.row_number} полностью выполнена!\n"
+                    message += f"**Ресурс:** {self.resource}\n"
+                    message += f"**Игрок:** {self.player}\n"
+                    message += f"**Выдано:** {new_issued}/{self.total}"
+
+                    # Notify player
+                    row = sheets.get_row(self.row_number)
+                    player_id = row.get("DiscordID")
+                    if player_id:
+                        try:
+                            guild = interaction.guild
+                            member = guild.get_member(int(player_id))
+                            if member:
+                                embed = discord.Embed(
+                                    title="🎉 Ваша заявка выполнена!",
+                                    description=f"**{self.resource}** x{self.total}",
+                                    color=discord.Color.green(),
+                                    timestamp=datetime.now(timezone.utc)
+                                )
+                                embed.add_field(name="👮 Выдал", value=interaction.user.display_name, inline=True)
+                                embed.add_field(name="📦 Количество", value=f"{self.total} единиц", inline=True)
+                                embed.set_footer(text=f"ID заявки: {row.get('RowID', '')[:8]}")
+
+                                await member.send(embed=embed)
+                        except Exception:
+                            logger.debug("Could not DM player")
+                else:
+                    message = f"✅ Выдано {quantity} единиц для заявки #{self.row_number}\n"
+                    message += f"**Ресурс:** {self.resource}\n"
+                    message += f"**Игрок:** {self.player}\n"
+                    message += f"**Прогресс:** {new_issued}/{self.total} (осталось: {remaining})"
+
+                await interaction.response.send_message(message, ephemeral=True)
+
+                # Update queue view
+                await self._refresh_queue_view(interaction)
+            else:
+                await interaction.response.send_message(
+                    "❌ Ошибка при обновлении заявки.",
+                    ephemeral=True
+                )
+
+        except Exception as e:
+            logger.exception(f"Error issuing quantity: {e}")
+            await interaction.response.send_message(
+                "❌ Произошла ошибка.",
+                ephemeral=True
+            )
+
+    async def _unissue_quantity(self, interaction: discord.Interaction, quantity: int):
+        """Вернуть указанное количество"""
+        try:
+            # Проверяем, что количество не превышает выданное
+            if quantity > self.issued:
+                await interaction.response.send_message(
+                    f"❌ Нельзя вернуть {quantity}, выдано только {self.issued}.",
+                    ephemeral=True
+                )
+                return
+
+            new_issued = max(0, self.issued - quantity)
+
+            # Update in database
+            success = sheets.update_issued_quantity(self.row_number, new_issued)
+
+            if success:
+                message = f"↩️ Возвращено {quantity} единиц для заявки #{self.row_number}\n"
+                message += f"**Ресурс:** {self.resource}\n"
+                message += f"**Игрок:** {self.player}\n"
+                message += f"**Текущий прогресс:** {new_issued}/{self.total}"
+
+                await interaction.response.send_message(message, ephemeral=True)
+
+                # Update queue view
+                await self._refresh_queue_view(interaction)
+            else:
+                await interaction.response.send_message(
+                    "❌ Ошибка при обновлении заявки.",
+                    ephemeral=True
+                )
+
+        except Exception as e:
+            logger.exception(f"Error unissuing quantity: {e}")
+            await interaction.response.send_message(
+                "❌ Произошла ошибка.",
+                ephemeral=True
+            )
+
+    async def _complete_request(self, interaction: discord.Interaction):
+        """Завершить заявку"""
+        try:
+            # Mark as completed
+            success = sheets.complete_request(self.row_number)
+
+            if success:
+                message = f"✅ Заявка #{self.row_number} отмечена как выполненная!\n"
+                message += f"**Ресурс:** {self.resource}\n"
+                message += f"**Игрок:** {self.player}\n"
+                message += f"**Количество:** {self.total} единиц"
+
+                await interaction.response.send_message(message, ephemeral=True)
+
+                # Update queue view
+                await self._refresh_queue_view(interaction)
+            else:
+                await interaction.response.send_message(
+                    "❌ Ошибка при завершении заявки.",
+                    ephemeral=True
+                )
+
+        except Exception as e:
+            logger.exception(f"Error completing request: {e}")
+            await interaction.response.send_message(
+                "❌ Произошла ошибка.",
+                ephemeral=True
+            )
+
+    async def _cancel_request(self, interaction: discord.Interaction):
+        """Отменить заявку"""
+        try:
+            # Confirm cancellation
+            confirm_embed = discord.Embed(
+                title="⚠️ Подтверждение отмены",
+                description="Вы уверены, что хотите полностью отменить эту заявку?",
+                color=discord.Color.red()
+            )
+
+            confirm_view = ConfirmCancelView(self.row_number)
+            await interaction.response.send_message(
+                embed=confirm_embed,
+                view=confirm_view,
+                ephemeral=True
+            )
+
+        except Exception as e:
+            logger.exception(f"Error cancelling request: {e}")
+            await interaction.response.send_message(
+                "❌ Произошла ошибка.",
+                ephemeral=True
+            )
+
+    async def _refresh_queue_view(self, interaction: discord.Interaction):
+        """Обновить представление очереди"""
+        try:
+            # Найти оригинальное сообщение с очередью и обновить его
+            channel = interaction.channel
+            async for message in channel.history(limit=50):
+                if message.author == bot.user and message.embeds:
+                    if "Управление очередью" in message.embeds[0].title:
+                        # Get updated active requests
+                        active_requests = sheets.get_active_requests()
+
+                        # Recreate view
+                        new_view = QueueManagementView(active_requests, page=0)
+
+                        # Update message
+                        await message.edit(view=new_view)
+                        break
+        except Exception as e:
+            logger.exception(f"Error refreshing queue view: {e}")
+
+class ConfirmCancelView(View):
+    """Confirmation view for request cancellation."""
+
+    def __init__(self, row_number: int):
+        super().__init__(timeout=60)
+        self.row_number = row_number
+
+    @button(label="✅ Да, отменить", style=discord.ButtonStyle.danger)
+    async def confirm_button(self, interaction: discord.Interaction, button: Button):
+        try:
+            # Cancel request via queue manager
+            async with sheets_lock:
+                queue.cancel_request_by_row(self.row_number, requester_id=interaction.user.id)
+
+            # Get request info for notification
+            row = sheets.get_row(self.row_number)
+            if row:
+                message = f"❌ Заявка #{self.row_number} отменена администратором\n"
+                message += f"**Ресурс:** {row.get('ResourceName')}\n"
+                message += f"**Игрок:** {row.get('DiscordName')}"
+
+                # Notify player
+                player_id = row.get("DiscordID")
+                if player_id:
+                    try:
+                        guild = interaction.guild
+                        member = guild.get_member(int(player_id))
+                        if member:
+                            await member.send(f"❌ Ваша заявка на {row.get('ResourceName')} была отменена администратором.")
+                    except Exception:
+                        logger.debug("Could not DM player")
+            else:
+                message = f"✅ Заявка #{self.row_number} успешно отменена."
+
+            await interaction.response.edit_message(content=message, embed=None, view=None)
+
+            # Refresh queue view in original message
+            await self._refresh_original_queue_view(interaction)
+
+        except Exception as e:
+            logger.exception(f"Error confirming cancellation: {e}")
+            await interaction.response.send_message(
+                "❌ Ошибка при отмене заявки.",
+                ephemeral=True
+            )
+
+    @button(label="❌ Нет, оставить", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.edit_message(
+            content="❎ Отмена заявки отменена.",
+            embed=None,
+            view=None
+        )
+
+    async def _refresh_original_queue_view(self, interaction: discord.Interaction):
+        """Refresh the original queue view."""
+        try:
+            # Get the original message
+            channel = interaction.channel
+            async for message in channel.history(limit=50):
+                if message.author == bot.user and message.embeds:
+                    if "Управление очередью" in message.embeds[0].title:
+                        # Get updated active requests
+                        active_requests = sheets.get_active_requests()
+
+                        # Recreate view
+                        new_view = QueueManagementView(active_requests, page=0)
+
+                        # Update message
+                        await message.edit(view=new_view)
+                        break
+        except Exception as e:
+            logger.exception(f"Error refreshing original queue view: {e}")
+
+@bot.command(name="очередь")
+async def cmd_queue(ctx: commands.Context, resource_name: str = None):
+    """Показывает текущую очередь заявок с возможностью управления."""
+    try:
+        # Check permissions - regular users can only view
+        is_admin = ctx.author.guild_permissions.administrator
+
+        init_adapters()
+        async with sheets_lock:
+            active_requests = sheets.get_active_requests()
+
+        if resource_name:
+            # Filter by resource
+            active_requests = [
+                r for r in active_requests
+                if r.get("ResourceName", "").lower() == resource_name.lower()
+            ]
+
+        if not active_requests:
+            await ctx.send(
+                f"📭 Нет активных заявок{f' на ресурс {resource_name}' if resource_name else ''}.",
+                ephemeral=True
+            )
+            return
+
+        # Sort by resource, then by queue position
+        active_requests.sort(
+            key=lambda x: (
+                x.get("ResourceName", ""),
+                int(x.get("QueuePosition", 999))
+            )
+        )
+
+        if is_admin:
+            # Show management interface for admins
+            view = QueueManagementView(active_requests, page=0)
+            embed = view._create_embed()
+            await ctx.send(embed=embed, view=view, ephemeral=True)
+        else:
+            # Show read-only interface for regular users
+            embed = await _create_readonly_queue_embed(active_requests, resource_name)
+            await ctx.send(embed=embed, ephemeral=True)
+
+        # Delete command message after 120 seconds
         await asyncio.sleep(120)
         try:
             await ctx.message.delete()
@@ -999,8 +1646,61 @@ async def cmd_queue(ctx: commands.Context, resource_name: str = None):
             pass
 
     except Exception as e:
-        logger.exception("cmd_queue error: %s", e)
-        await ctx.send("Ошибка при получении информации об очереди.", ephemeral=True)
+        logger.exception(f"cmd_queue error: {e}")
+        await ctx.send("❌ Ошибка при получении информации об очереди.", ephemeral=True)
+
+async def _create_readonly_queue_embed(requests: List[Dict[str, Any]],
+                                      resource_filter: str = None) -> discord.Embed:
+    """Create read-only embed for queue."""
+    embed = discord.Embed(
+        title="📋 Текущая очередь заявок",
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    # Group by resource
+    resources_dict = {}
+    for req in requests:
+        resource = req.get("ResourceName")
+        if resource not in resources_dict:
+            resources_dict[resource] = []
+        resources_dict[resource].append(req)
+
+    # Sort each resource by queue position
+    for resource, reqs in resources_dict.items():
+        reqs.sort(key=lambda x: int(x.get("QueuePosition", 999)))
+
+    # Add fields for each resource (limit to 5 resources)
+    for resource, reqs in list(resources_dict.items())[:5]:
+        queue_text = ""
+
+        for req in reqs[:10]:  # Limit to 10 requests per resource
+            player = req.get("DiscordName", "Неизвестно")
+            character = req.get("CharacterName", "Неизвестно")
+            quantity = req.get("Quantity", "?")
+            issued = req.get("IssuedQuantity", 0)
+            remaining = req.get("Remaining", quantity)
+            pos = req.get("QueuePosition", "?")
+
+            if issued > 0:
+                queue_text += f"{pos}. {player} ({character}) - {issued}/{quantity} выдано\n"
+            else:
+                queue_text += f"{pos}. {player} ({character}) - {quantity} в ожидании\n"
+
+        if len(reqs) > 10:
+            queue_text += f"... и еще {len(reqs) - 10} заявок"
+
+        if not queue_text:
+            queue_text = "Нет заявок"
+
+        embed.add_field(name=f"**{resource}**", value=queue_text, inline=False)
+
+    if len(resources_dict) > 5:
+        embed.set_footer(text=f"Показано 5 из {len(resources_dict)} ресурсов")
+    else:
+        embed.set_footer(text=f"Всего заявок: {len(requests)}")
+
+    return embed
 
 # Error handlers
 @bot.event

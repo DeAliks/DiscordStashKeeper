@@ -7,3 +7,4 @@ google-auth-httplib2>=0.1.0
 python-dotenv>=1.0.0
 aiohttp>=3.8.5
 pytest>=7.4.0
+self

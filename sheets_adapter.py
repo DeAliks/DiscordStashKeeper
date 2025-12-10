@@ -1,4 +1,7 @@
-# sheets_adapter.py
+"""
+SheetsAdapter with support for issue management
+"""
+
 import logging
 import time
 from typing import List, Dict, Any, Optional
@@ -16,13 +19,16 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
+
 class SheetsAdapter:
     """
     Adapter for Google Sheets using gspread and a service account.
     Expectation: first row contains headers exactly as in config/table spec.
     """
 
-    def __init__(self, creds_file: str = config.GOOGLE_CREDENTIALS_FILE, spreadsheet_id: str = config.SPREADSHEET_ID, sheet_name: str = config.SHEET_NAME):
+    def __init__(self, creds_file: str = config.GOOGLE_CREDENTIALS_FILE,
+                 spreadsheet_id: str = config.SPREADSHEET_ID,
+                 sheet_name: str = config.SHEET_NAME):
         self.creds_file = creds_file
         self.spreadsheet_id = spreadsheet_id
         self.sheet_name = sheet_name
@@ -74,7 +80,7 @@ class SheetsAdapter:
                 self.sheet.append_row(values, value_input_option=value_input_option)
                 return
             except APIError as e:
-                logger.warning("append_row APIError attempt %s: %s", attempt+1, e)
+                logger.warning("append_row APIError attempt %s: %s", attempt + 1, e)
                 time.sleep(1 + attempt * 2)
             except Exception as e:
                 logger.exception("append_row error: %s", e)
@@ -145,6 +151,20 @@ class SheetsAdapter:
         for idx, header in enumerate(headers):
             val = values[idx] if idx < len(values) else ""
             row[header] = val
+
+        # Преобразуем числовые поля в int
+        numeric_fields = ["Quantity", "IssuedQuantity", "Remaining", "PriorityLevel"]
+        for field in numeric_fields:
+            if field in row and row[field]:
+                try:
+                    row[field] = int(row[field])
+                except ValueError:
+                    row[field] = 0
+            else:
+                row[field] = 0
+
+        # Добавляем номер строки для удобства
+        row["__row_number"] = row_number
         return row
 
     # ---- Utility: recompute queue positions for a given resource ----
@@ -166,6 +186,7 @@ class SheetsAdapter:
             return
 
         header_row = all_values[0]
+
         # find indices of columns
         def col_idx(col_name):
             try:
@@ -211,3 +232,94 @@ class SheetsAdapter:
                 self.sheet.update_cell(rownum, idx_queuepos + 1, str(pos))
             except Exception as e:
                 logger.exception("Failed to update QueuePosition for row %s: %s", rownum, e)
+
+    # ---- Issue management methods ----
+    def get_active_requests(self) -> List[Dict[str, Any]]:
+        """Get all active and pending requests with numeric fields converted."""
+        try:
+            records = self.get_all_records()
+            active = []
+
+            for record in records:
+                status = record.get("Status", "").lower()
+                if status in ("active", "pending"):
+                    # Convert numeric fields
+                    numeric_fields = ["Quantity", "IssuedQuantity", "Remaining", "PriorityLevel"]
+                    for field in numeric_fields:
+                        if field in record and record[field]:
+                            try:
+                                record[field] = int(record[field])
+                            except ValueError:
+                                record[field] = 0
+                        else:
+                            record[field] = 0
+
+                    active.append(record)
+
+            return active
+        except Exception as e:
+            logger.exception("get_active_requests error: %s", e)
+            return []
+
+    def update_issued_quantity(self, row_number: int, issued_quantity: int,
+                               completed: bool = False) -> bool:
+        """Update issued quantity and remaining for a request."""
+        try:
+            # Get current row
+            row = self.get_row(row_number)
+            if not row:
+                return False
+
+            total_quantity = row.get("Quantity", 0)
+
+            # Calculate remaining
+            remaining = max(0, total_quantity - issued_quantity)
+
+            # Prepare updates
+            updates = {
+                "IssuedQuantity": str(issued_quantity),
+                "Remaining": str(remaining)
+            }
+
+            if completed:
+                updates["Status"] = "completed"
+                updates["QueuePosition"] = ""
+
+            # Update row
+            self.update_row(row_number, updates)
+
+            # If completed, recompute queue positions
+            if completed:
+                resource = row.get("ResourceName")
+                if resource:
+                    self.recompute_queue_positions(resource)
+
+            return True
+        except Exception as e:
+            logger.exception("update_issued_quantity error: %s", e)
+            return False
+
+    def complete_request(self, row_number: int) -> bool:
+        """Mark request as completed."""
+        try:
+            row = self.get_row(row_number)
+            if not row:
+                return False
+
+            updates = {
+                "Status": "completed",
+                "QueuePosition": "",
+                "IssuedQuantity": str(row.get("Quantity", 0)),
+                "Remaining": "0"
+            }
+            self.update_row(row_number, updates)
+
+            # Recompute queue positions for the resource
+            resource = row.get("ResourceName")
+            if resource:
+                self.recompute_queue_positions(resource)
+
+            return True
+        except Exception as e:
+            logger.exception("complete_request error: %s", e)
+            return False

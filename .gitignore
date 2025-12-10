@@ -17,6 +17,7 @@ env/
 logs/
 *.sqlite
 *.db
+*.zip
 
 # Config files — приватные ключи !!!
 config.py
