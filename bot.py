@@ -1061,10 +1061,9 @@ class IssueQuantityModal(Modal):
                         active_requests = sheets.get_active_requests()
 
                         # Recreate view
-                        new_view = QueueManagementView(active_requests, page=0)
-
-                        # Update message
-                        await message.edit(view=new_view)
+                        new_view = QueueManagementView(active_requests)
+                        embed = new_view._create_embed()
+                        await message.edit(embed=embed, view=new_view)
                         break
         except Exception as e:
             logger.exception(f"Error refreshing queue view: {e}")
@@ -1164,340 +1163,328 @@ class UnissueQuantityModal(Modal):
                         active_requests = sheets.get_active_requests()
 
                         # Recreate view
-                        new_view = QueueManagementView(active_requests, page=0)
-
-                        # Update message
-                        await message.edit(view=new_view)
+                        new_view = QueueManagementView(active_requests)
+                        embed = new_view._create_embed()
+                        await message.edit(embed=embed, view=new_view)
                         break
         except Exception as e:
             logger.exception(f"Error refreshing queue view: {e}")
 
 # ----- Команда для просмотра и управления очередью -----
-class QueueManagementView(View):
-    """View for managing requests in queue."""
+class QueueSelectView(View):
+    """View with dropdown for selecting a request to manage."""
 
-    def __init__(self, requests: List[Dict[str, Any]], page: int = 0):
-        super().__init__(timeout=300)  # 5 минут на управление
+    def __init__(self, requests: List[Dict[str, Any]]):
+        super().__init__(timeout=300)
         self.requests = requests
-        self.page = page
-        self.items_per_page = 5
 
-        # Calculate pages
-        self.total_pages = (len(requests) + self.items_per_page - 1) // self.items_per_page
-
-        # Add navigation buttons if needed
-        if self.total_pages > 1:
-            self.add_item(PreviousButton())
-            self.add_item(NextButton())
-
-        # Add request management buttons for current page
-        self._add_request_buttons()
-
-    def _add_request_buttons(self):
-        """Add buttons for requests on current page."""
-        start_idx = self.page * self.items_per_page
-        end_idx = min(start_idx + self.items_per_page, len(self.requests))
-
-        for i in range(start_idx, end_idx):
-            req = self.requests[i]
-            row_num = req.get("__row_number")
-            resource = req.get("ResourceName", "Unknown")
-            player = req.get("DiscordName", "Unknown")
-            character = req.get("CharacterName", "Unknown")
-            issued = req.get("IssuedQuantity", 0)
+        # Create select dropdown
+        options = []
+        for req in requests[:25]:  # Discord limit
+            row_num = req.get("__row_number", "?")
+            resource = req.get("ResourceName", "Unknown")[:50]
+            player = req.get("DiscordName", "Unknown")[:20]
+            position = req.get("QueuePosition", "?")
+            remaining = req.get("Remaining", 0)
             total = req.get("Quantity", 0)
-            remaining = req.get("Remaining", total)
 
-            # Создаем кнопки для управления заявкой
-            button_view = QueueButton(row_num, resource, player, character, issued, total, remaining)
-            self.add_item(button_view)
+            label = f"#{position} {resource}"
+            description = f"{player} - {remaining}/{total}"
 
-    def _create_embed(self) -> discord.Embed:
-        """Create embed for current page."""
-        start_idx = self.page * self.items_per_page
-        end_idx = min(start_idx + self.items_per_page, len(self.requests))
+            options.append(discord.SelectOption(
+                label=label[:100],
+                description=description[:100],
+                value=str(row_num)
+            ))
 
+        if options:
+            select = Select(
+                placeholder="Выберите заявку для управления...",
+                options=options,
+                min_values=1,
+                max_values=1
+            )
+            select.callback = self.select_callback
+            self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        selected_row_num = int(self.children[0].values[0])
+
+        # Find the request
+        selected_req = None
+        for req in self.requests:
+            if req.get("__row_number") == selected_row_num:
+                selected_req = req
+                break
+
+        if not selected_req:
+            await interaction.response.send_message("Заявка не найдена.", ephemeral=True)
+            return
+
+        # Create action buttons view
+        action_view = RequestActionView(selected_req, self.requests)
+
+        # Update message with selected request details
         embed = discord.Embed(
-            title="📋 Управление очередью заявок",
-            description="Используйте кнопки для выдачи ресурсов",
+            title="📋 Управление заявкой",
             color=discord.Color.gold(),
             timestamp=datetime.now(timezone.utc)
         )
 
-        if not self.requests:
-            embed.description = "Нет активных заявок для управления."
-            return embed
+        resource = selected_req.get("ResourceName", "Unknown")
+        player = selected_req.get("DiscordName", "Unknown")
+        character = selected_req.get("CharacterName", "Unknown")
+        total = selected_req.get("Quantity", 0)
+        issued = selected_req.get("IssuedQuantity", 0)
+        remaining = selected_req.get("Remaining", total)
+        position = selected_req.get("QueuePosition", "?")
+        priority = selected_req.get("PriorityLevel", 1)
 
-        for i in range(start_idx, end_idx):
-            req = self.requests[i]
-            resource = req.get("ResourceName", "Unknown")
-            player = req.get("DiscordName", "Unknown")
-            character = req.get("CharacterName", "Unknown")
-            total = req.get("Quantity", 0)
-            issued = req.get("IssuedQuantity", 0)
-            remaining = req.get("Remaining", total)
-            position = req.get("QueuePosition", "?")
-            priority = req.get("PriorityLevel", 1)
+        embed.add_field(name="Ресурс", value=resource, inline=True)
+        embed.add_field(name="Игрок", value=player, inline=True)
+        embed.add_field(name="Персонаж", value=character, inline=True)
+        embed.add_field(name="Заказано", value=str(total), inline=True)
+        embed.add_field(name="Выдано", value=str(issued), inline=True)
+        embed.add_field(name="Осталось", value=str(remaining), inline=True)
+        embed.add_field(name="Позиция", value=f"#{position}", inline=True)
 
-            # Create field value
-            field_value = f"**Игрок:** {player}\n"
-            field_value += f"**Персонаж:** {character}\n"
-            field_value += f"**Заказано:** {total} | **Выдано:** {issued} | **Осталось:** {remaining}\n"
-            field_value += f"**Позиция:** #{position}"
+        if int(priority) > DEFAULT_PRIORITY:
+            embed.add_field(name="Приоритет", value=f"👑 Уровень {priority}", inline=True)
 
-            if int(priority) > DEFAULT_PRIORITY:
-                field_value += f" | 👑 Приоритет {priority}"
+        embed.set_footer(text=f"ID заявки: {selected_row_num}")
+
+        await interaction.response.edit_message(embed=embed, view=action_view)
+
+
+class RequestActionView(View):
+    """Buttons for managing a single selected request."""
+
+    def __init__(self, request: Dict[str, Any], all_requests: List[Dict[str, Any]]):
+        super().__init__(timeout=300)
+        self.request = request
+        self.all_requests = all_requests
+        self.row_number = request.get("__row_number")
+        self.remaining = request.get("Remaining", 0)
+        self.issued = request.get("IssuedQuantity", 0)
+        self.total = request.get("Quantity", 0)
+        self.resource = request.get("ResourceName", "Unknown")
+        self.player = request.get("DiscordName", "Unknown")
+
+    @button(label="➕ Выдать", style=discord.ButtonStyle.primary, row=0)
+    async def issue_button(self, interaction: discord.Interaction, button: Button):
+        if self.remaining <= 0:
+            await interaction.response.send_message("❌ Нечего выдавать - заявка уже выполнена.", ephemeral=True)
+            return
+
+        modal = IssueQuantityModal(
+            self.row_number,
+            self.resource,
+            self.player,
+            self.remaining
+        )
+        await interaction.response.send_modal(modal)
+
+    @button(label="➖ Вернуть", style=discord.ButtonStyle.secondary, row=0)
+    async def unissue_button(self, interaction: discord.Interaction, button: Button):
+        if self.issued <= 0:
+            await interaction.response.send_message("❌ Нечего возвращать.", ephemeral=True)
+            return
+
+        modal = UnissueQuantityModal(
+            self.row_number,
+            self.resource,
+            self.player,
+            self.issued
+        )
+        await interaction.response.send_modal(modal)
+
+    @button(label="✅ Завершить", style=discord.ButtonStyle.green, row=1)
+    async def complete_button(self, interaction: discord.Interaction, button: Button):
+        try:
+            success = sheets.complete_request(self.row_number)
+            if success:
+                await interaction.response.send_message(
+                    f"✅ Заявка #{self.row_number} завершена!", ephemeral=True
+                )
+
+                # Refresh the view
+                await self._refresh_queue_view(interaction)
+            else:
+                await interaction.response.send_message("❌ Ошибка при завершении.", ephemeral=True)
+        except Exception as e:
+            logger.exception(f"Error completing request: {e}")
+            await interaction.response.send_message("❌ Произошла ошибка.", ephemeral=True)
+
+    @button(label="❌ Отменить", style=discord.ButtonStyle.danger, row=1)
+    async def cancel_button(self, interaction: discord.Interaction, button: Button):
+        confirm_view = ConfirmCancelView(self.row_number, self.all_requests)
+        await interaction.response.send_message(
+            "⚠️ Подтвердите отмену заявки:",
+            view=confirm_view,
+            ephemeral=True
+        )
+
+    @button(label="🔙 Назад к списку", style=discord.ButtonStyle.secondary, row=2)
+    async def back_button(self, interaction: discord.Interaction, button: Button):
+        # Get updated list of requests
+        active_requests = sheets.get_active_requests()
+        queue_view = QueueSelectView(active_requests)
+
+        embed = discord.Embed(
+            title="📋 Управление очередью заявок",
+            description="Выберите заявку для управления из списка ниже",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc)
+        )
+
+        if active_requests:
+            # Группируем по ресурсам для статистики
+            resource_stats = {}
+            for req in active_requests:
+                resource = req.get("ResourceName")
+                if resource not in resource_stats:
+                    resource_stats[resource] = 0
+                resource_stats[resource] += 1
+
+            stats_text = ""
+            for resource, count in list(resource_stats.items())[:3]:
+                stats_text += f"**{resource}:** {count} заявок\n"
+
+            if len(resource_stats) > 3:
+                stats_text += f"... и еще {len(resource_stats) - 3} ресурсов"
 
             embed.add_field(
-                name=f"📦 {resource} (ID: {req.get('__row_number')})",
-                value=field_value,
+                name="📊 Статистика",
+                value=stats_text or "Нет данных",
                 inline=False
             )
 
-        embed.set_footer(text=f"Страница {self.page + 1}/{self.total_pages} | Всего заявок: {len(self.requests)}")
-        return embed
+        embed.set_footer(text=f"Всего активных заявок: {len(active_requests)}")
 
-class PreviousButton(Button):
-    def __init__(self):
-        super().__init__(label="⬅️ Назад", style=discord.ButtonStyle.secondary)
-
-    async def callback(self, interaction: discord.Interaction):
-        view: QueueManagementView = self.view
-        if view.page > 0:
-            view.page -= 1
-
-            # Обновляем сообщение
-            embed = view._create_embed()
-            await interaction.response.edit_message(embed=embed, view=view)
-
-class NextButton(Button):
-    def __init__(self):
-        super().__init__(label="➡️ Вперед", style=discord.ButtonStyle.secondary)
-
-    async def callback(self, interaction: discord.Interaction):
-        view: QueueManagementView = self.view
-        if view.page < view.total_pages - 1:
-            view.page += 1
-
-            # Обновляем сообщение
-            embed = view._create_embed()
-            await interaction.response.edit_message(embed=embed, view=view)
-
-
-# ----- Команда для просмотра и управления очередью -----
-class QueueButton(Button):
-    """Кнопка для управления конкретной заявкой"""
-
-    def __init__(self, row_number: int, resource: str, player: str, character: str,
-                 issued: int, total: int, remaining: int, action: str, **kwargs):
-        super().__init__(**kwargs)
-        self.row_number = row_number
-        self.resource = resource
-        self.player = player
-        self.character = character
-        self.issued = issued
-        self.total = total
-        self.remaining = remaining
-        self.action = action
-
-    async def callback(self, interaction: discord.Interaction):
-        # Получаем родительское view
-        view: QueueManagementView = self.view
-
-        if self.action == "issue_custom":
-            modal = IssueQuantityModal(self.row_number, self.resource, self.player, self.remaining)
-            await interaction.response.send_modal(modal)
-        elif self.action == "complete":
-            await self._complete_request(interaction)
-        elif self.action == "cancel":
-            await self._cancel_request(interaction)
-        elif self.action == "unissue_custom":
-            modal = UnissueQuantityModal(self.row_number, self.resource, self.player, self.issued)
-            await interaction.response.send_modal(modal)
-
-    async def _complete_request(self, interaction: discord.Interaction):
-        """Завершить заявку"""
-        try:
-            # Mark as completed
-            success = sheets.complete_request(self.row_number)
-
-            if success:
-                message = f"✅ Заявка #{self.row_number} отмечена как выполненная!\n"
-                message += f"**Ресурс:** {self.resource}\n"
-                message += f"**Игрок:** {self.player}\n"
-                message += f"**Количество:** {self.total} единиц"
-
-                await interaction.response.send_message(message, ephemeral=True)
-
-                # Update queue view
-                await self._refresh_queue_view(interaction)
-            else:
-                await interaction.response.send_message(
-                    "❌ Ошибка при завершении заявки.",
-                    ephemeral=True
-                )
-
-        except Exception as e:
-            logger.exception(f"Error completing request: {e}")
-            await interaction.response.send_message(
-                "❌ Произошла ошибка.",
-                ephemeral=True
-            )
-
-    async def _cancel_request(self, interaction: discord.Interaction):
-        """Отменить заявку"""
-        try:
-            # Confirm cancellation
-            confirm_embed = discord.Embed(
-                title="⚠️ Подтверждение отмены",
-                description="Вы уверены, что хотите полностью отменить эту заявку?",
-                color=discord.Color.red()
-            )
-
-            confirm_view = ConfirmCancelView(self.row_number)
-            await interaction.response.send_message(
-                embed=confirm_embed,
-                view=confirm_view,
-                ephemeral=True
-            )
-
-        except Exception as e:
-            logger.exception(f"Error cancelling request: {e}")
-            await interaction.response.send_message(
-                "❌ Произошла ошибка.",
-                ephemeral=True
-            )
+        await interaction.response.edit_message(embed=embed, view=queue_view)
 
     async def _refresh_queue_view(self, interaction: discord.Interaction):
         """Обновить представление очереди"""
         try:
-            # Найти оригинальное сообщение с очередью и обновить его
-            channel = interaction.channel
-            async for message in channel.history(limit=50):
-                if message.author == bot.user and message.embeds:
-                    if "Управление очередью" in message.embeds[0].title:
-                        # Get updated active requests
-                        active_requests = sheets.get_active_requests()
+            # Get updated list of requests
+            active_requests = sheets.get_active_requests()
+            queue_view = QueueSelectView(active_requests)
 
-                        # Recreate view
-                        new_view = QueueManagementView(active_requests, page=0)
+            embed = discord.Embed(
+                title="📋 Управление очередью заявок",
+                description="Выберите заявку для управления из списка ниже",
+                color=discord.Color.gold(),
+                timestamp=datetime.now(timezone.utc)
+            )
 
-                        # Update message
-                        await message.edit(view=new_view)
-                        break
+            if active_requests:
+                embed.add_field(
+                    name="Доступные заявки",
+                    value=f"{len(active_requests)} активных заявок",
+                    inline=False
+                )
+
+            await interaction.response.edit_message(embed=embed, view=queue_view)
         except Exception as e:
             logger.exception(f"Error refreshing queue view: {e}")
+            await interaction.response.send_message("❌ Ошибка при обновлении списка.", ephemeral=True)
 
 
 class QueueManagementView(View):
     """View for managing requests in queue."""
 
-    def __init__(self, requests: List[Dict[str, Any]], page: int = 0):
-        super().__init__(timeout=300)  # 5 минут на управление
+    def __init__(self, requests: List[Dict[str, Any]]):
+        super().__init__(timeout=300)
         self.requests = requests
-        self.page = page
-        self.items_per_page = 5
 
-        # Calculate pages
-        self.total_pages = (len(requests) + self.items_per_page - 1) // self.items_per_page
-
-        # Add navigation buttons if needed
-        if self.total_pages > 1:
-            self.add_item(PreviousButton())
-            self.add_item(NextButton())
-
-        # Add request management buttons for current page
-        self._add_request_buttons()
-
-    def _add_request_buttons(self):
-        """Add buttons for requests on current page."""
-        start_idx = self.page * self.items_per_page
-        end_idx = min(start_idx + self.items_per_page, len(self.requests))
-
-        for i in range(start_idx, end_idx):
-            req = self.requests[i]
-            row_num = req.get("__row_number")
-            resource = req.get("ResourceName", "Unknown")
-            player = req.get("DiscordName", "Unknown")
-            character = req.get("CharacterName", "Unknown")
-            issued = req.get("IssuedQuantity", 0)
+        # Create select dropdown
+        options = []
+        for req in requests[:25]:  # Discord limit
+            row_num = req.get("__row_number", "?")
+            resource = req.get("ResourceName", "Unknown")[:50]
+            player = req.get("DiscordName", "Unknown")[:20]
+            position = req.get("QueuePosition", "?")
+            remaining = req.get("Remaining", 0)
             total = req.get("Quantity", 0)
-            remaining = req.get("Remaining", total)
 
-            # Создаем кнопки для управления заявкой
-            # Кнопка "Выдать произвольное количество"
-            issue_btn = QueueButton(
-                row_number=row_num,
-                resource=resource,
-                player=player,
-                character=character,
-                issued=issued,
-                total=total,
-                remaining=remaining,
-                action="issue_custom",
-                label="➕ Выдать",
-                style=discord.ButtonStyle.primary,
-                row=i
+            label = f"#{position} {resource}"
+            description = f"{player} - {remaining}/{total}"
+
+            options.append(discord.SelectOption(
+                label=label[:100],
+                description=description[:100],
+                value=str(row_num)
+            ))
+
+        if options:
+            select = Select(
+                placeholder="Выберите заявку для управления...",
+                options=options,
+                min_values=1,
+                max_values=1
             )
-            self.add_item(issue_btn)
+            select.callback = self.select_callback
+            self.add_item(select)
 
-            # Кнопка "Завершить"
-            complete_btn = QueueButton(
-                row_number=row_num,
-                resource=resource,
-                player=player,
-                character=character,
-                issued=issued,
-                total=total,
-                remaining=remaining,
-                action="complete",
-                label="✅ Завершить",
-                style=discord.ButtonStyle.green,
-                row=i
-            )
-            self.add_item(complete_btn)
+    async def select_callback(self, interaction: discord.Interaction):
+        selected_row_num = int(self.children[0].values[0])
 
-            # Кнопка "Отменить"
-            cancel_btn = QueueButton(
-                row_number=row_num,
-                resource=resource,
-                player=player,
-                character=character,
-                issued=issued,
-                total=total,
-                remaining=remaining,
-                action="cancel",
-                label="❌ Отменить",
-                style=discord.ButtonStyle.danger,
-                row=i
-            )
-            self.add_item(cancel_btn)
+        # Find the request
+        selected_req = None
+        for req in self.requests:
+            if req.get("__row_number") == selected_row_num:
+                selected_req = req
+                break
 
-            # Опционально: кнопка для возврата (если нужно)
-            if issued > 0:
-                unissue_btn = QueueButton(
-                    row_number=row_num,
-                    resource=resource,
-                    player=player,
-                    character=character,
-                    issued=issued,
-                    total=total,
-                    remaining=remaining,
-                    action="unissue_custom",
-                    label="➖ Вернуть",
-                    style=discord.ButtonStyle.secondary,
-                    row=i
-                )
-                self.add_item(unissue_btn)
+        if not selected_req:
+            await interaction.response.send_message("Заявка не найдена.", ephemeral=True)
+            return
+
+        # Create action buttons view
+        action_view = RequestActionView(selected_req, self.requests)
+
+        # Update message with selected request details
+        embed = self._create_request_embed(selected_req)
+
+        await interaction.response.edit_message(embed=embed, view=action_view)
+
+    def _create_request_embed(self, req: Dict[str, Any]) -> discord.Embed:
+        """Create embed for a single request."""
+        embed = discord.Embed(
+            title="📋 Управление заявкой",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(timezone.utc)
+        )
+
+        resource = req.get("ResourceName", "Unknown")
+        player = req.get("DiscordName", "Unknown")
+        character = req.get("CharacterName", "Unknown")
+        total = req.get("Quantity", 0)
+        issued = req.get("IssuedQuantity", 0)
+        remaining = req.get("Remaining", total)
+        position = req.get("QueuePosition", "?")
+        priority = req.get("PriorityLevel", 1)
+
+        embed.add_field(name="Ресурс", value=resource, inline=True)
+        embed.add_field(name="Игрок", value=player, inline=True)
+        embed.add_field(name="Персонаж", value=character, inline=True)
+        embed.add_field(name="Заказано", value=str(total), inline=True)
+        embed.add_field(name="Выдано", value=str(issued), inline=True)
+        embed.add_field(name="Осталось", value=str(remaining), inline=True)
+        embed.add_field(name="Позиция", value=f"#{position}", inline=True)
+
+        if int(priority) > DEFAULT_PRIORITY:
+            embed.add_field(name="Приоритет", value=f"👑 Уровень {priority}", inline=True)
+
+        embed.set_footer(text=f"ID заявки: {req.get('__row_number', '?')}")
+
+        return embed
 
     def _create_embed(self) -> discord.Embed:
-        """Create embed for current page."""
-        start_idx = self.page * self.items_per_page
-        end_idx = min(start_idx + self.items_per_page, len(self.requests))
-
+        """Create embed for the queue list."""
         embed = discord.Embed(
             title="📋 Управление очередью заявок",
-            description="Используйте кнопки для выдачи ресурсов",
+            description="Выберите заявку для управления из списка ниже",
             color=discord.Color.gold(),
             timestamp=datetime.now(timezone.utc)
         )
@@ -1506,73 +1493,59 @@ class QueueManagementView(View):
             embed.description = "Нет активных заявок для управления."
             return embed
 
-        for i in range(start_idx, end_idx):
-            req = self.requests[i]
-            resource = req.get("ResourceName", "Unknown")
-            player = req.get("DiscordName", "Unknown")
-            character = req.get("CharacterName", "Unknown")
-            total = req.get("Quantity", 0)
-            issued = req.get("IssuedQuantity", 0)
-            remaining = req.get("Remaining", total)
-            position = req.get("QueuePosition", "?")
-            priority = req.get("PriorityLevel", 1)
+        # Группируем по ресурсам для статистики
+        resource_stats = {}
+        for req in self.requests:
+            resource = req.get("ResourceName")
+            if resource not in resource_stats:
+                resource_stats[resource] = 0
+            resource_stats[resource] += 1
 
-            # Create field value
-            field_value = f"**Игрок:** {player}\n"
-            field_value += f"**Персонаж:** {character}\n"
-            field_value += f"**Заказано:** {total} | **Выдано:** {issued} | **Осталось:** {remaining}\n"
-            field_value += f"**Позиция:** #{position}"
+        stats_text = ""
+        for resource, count in list(resource_stats.items())[:5]:
+            stats_text += f"**{resource}:** {count} заявок\n"
 
-            if int(priority) > DEFAULT_PRIORITY:
-                field_value += f" | 👑 Приоритет {priority}"
+        if len(resource_stats) > 5:
+            stats_text += f"... и еще {len(resource_stats) - 5} ресурсов"
+
+        embed.add_field(
+            name="📊 Статистика по ресурсам",
+            value=stats_text or "Нет данных",
+            inline=False
+        )
+
+        # Показываем топ-5 ближайших заявок
+        if self.requests:
+            sorted_requests = sorted(self.requests, key=lambda x: int(x.get("QueuePosition", 999)))
+            top_requests = sorted_requests[:5]
+
+            queue_text = ""
+            for req in top_requests:
+                resource = req.get("ResourceName", "Unknown")
+                player = req.get("DiscordName", "Unknown")
+                position = req.get("QueuePosition", "?")
+                remaining = req.get("Remaining", 0)
+
+                queue_text += f"**#{position}** {resource} - {player} ({remaining} шт.)\n"
 
             embed.add_field(
-                name=f"📦 {resource} (ID: {req.get('__row_number')})",
-                value=field_value,
+                name="🚀 Ближайшие заявки",
+                value=queue_text,
                 inline=False
             )
 
-        embed.set_footer(text=f"Страница {self.page + 1}/{self.total_pages} | Всего заявок: {len(self.requests)}")
+        embed.set_footer(text=f"Всего активных заявок: {len(self.requests)}")
+
         return embed
 
-
-class PreviousButton(Button):
-    def __init__(self):
-        super().__init__(label="⬅️ Назад", style=discord.ButtonStyle.secondary, row=4)
-
-    async def callback(self, interaction: discord.Interaction):
-        view: QueueManagementView = self.view
-        if view.page > 0:
-            view.page -= 1
-
-            # Обновляем сообщение
-            embed = view._create_embed()
-            # Нужно пересоздать view с новыми кнопками
-            new_view = QueueManagementView(view.requests, page=view.page)
-            await interaction.response.edit_message(embed=embed, view=new_view)
-
-
-class NextButton(Button):
-    def __init__(self):
-        super().__init__(label="➡️ Вперед", style=discord.ButtonStyle.secondary, row=4)
-
-    async def callback(self, interaction: discord.Interaction):
-        view: QueueManagementView = self.view
-        if view.page < view.total_pages - 1:
-            view.page += 1
-
-            # Обновляем сообщение
-            embed = view._create_embed()
-            # Нужно пересоздать view с новыми кнопками
-            new_view = QueueManagementView(view.requests, page=view.page)
-            await interaction.response.edit_message(embed=embed, view=new_view)
 
 class ConfirmCancelView(View):
     """Confirmation view for request cancellation."""
 
-    def __init__(self, row_number: int):
+    def __init__(self, row_number: int, all_requests: List[Dict[str, Any]]):
         super().__init__(timeout=60)
         self.row_number = row_number
+        self.all_requests = all_requests
 
     @button(label="✅ Да, отменить", style=discord.ButtonStyle.danger)
     async def confirm_button(self, interaction: discord.Interaction, button: Button):
@@ -1584,7 +1557,7 @@ class ConfirmCancelView(View):
             # Get request info for notification
             row = sheets.get_row(self.row_number)
             if row:
-                message = f"❌ Заявка #{self.row_number} отменена администратором\n"
+                message = f"✅ Заявка #{self.row_number} отменена администратором\n"
                 message += f"**Ресурс:** {row.get('ResourceName')}\n"
                 message += f"**Игрок:** {row.get('DiscordName')}"
 
@@ -1595,7 +1568,17 @@ class ConfirmCancelView(View):
                         guild = interaction.guild
                         member = guild.get_member(int(player_id))
                         if member:
-                            await member.send(f"❌ Ваша заявка на {row.get('ResourceName')} была отменена администратором.")
+                            embed = discord.Embed(
+                                title="❌ Ваша заявка отменена",
+                                description=f"**{row.get('ResourceName')}**",
+                                color=discord.Color.red(),
+                                timestamp=datetime.now(timezone.utc)
+                            )
+                            embed.add_field(name="👮 Отменил", value=interaction.user.display_name, inline=True)
+                            embed.add_field(name="📋 Причина", value="Административное решение", inline=True)
+                            embed.set_footer(text=f"ID заявки: {row.get('RowID', '')[:8]}")
+
+                            await member.send(embed=embed)
                     except Exception:
                         logger.debug("Could not DM player")
             else:
@@ -1633,10 +1616,9 @@ class ConfirmCancelView(View):
                         active_requests = sheets.get_active_requests()
 
                         # Recreate view
-                        new_view = QueueManagementView(active_requests, page=0)
-
-                        # Update message
-                        await message.edit(view=new_view)
+                        new_view = QueueManagementView(active_requests)
+                        embed = new_view._create_embed()
+                        await message.edit(embed=embed, view=new_view)
                         break
         except Exception as e:
             logger.exception(f"Error refreshing original queue view: {e}")
@@ -1676,7 +1658,7 @@ async def cmd_queue(ctx: commands.Context, resource_name: str = None):
 
         if is_admin:
             # Show management interface for admins
-            view = QueueManagementView(active_requests, page=0)
+            view = QueueManagementView(active_requests)
             embed = view._create_embed()
             await ctx.send(embed=embed, view=view, ephemeral=True)
         else:
