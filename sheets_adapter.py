@@ -118,7 +118,7 @@ class SheetsAdapter:
 
     def update_row(self, row_number: int, updates: Dict[str, Any]) -> None:
         """
-        Update a row by mapping header->new_value.
+        Update a row by mapping header->new value.
         """
         if row_number < 1:
             raise ValueError("row_number must be >= 1")
@@ -171,6 +171,7 @@ class SheetsAdapter:
         except Exception as e:
             logger.exception(f"get_row error: {e}")
             return None
+
     # ---- Utility: recompute queue positions for a given resource ----
     def recompute_queue_positions(self, resource_name: str):
         """
@@ -239,31 +240,84 @@ class SheetsAdapter:
 
     # ---- Issue management methods ----
     def get_active_requests(self) -> List[Dict[str, Any]]:
-        """Get all active and pending requests with numeric fields converted."""
+        """
+        Получить все активные заявки с реальным номером строки в таблице.
+        Возвращает список словарей с ключом __row_number.
+        """
         try:
-            records = self.get_all_records()
-            active = []
+            # Получаем все данные как есть (включая заголовок)
+            all_values = self.sheet.get_all_values()
 
-            for record in records:
-                status = record.get("Status", "").lower()
-                if status in ("active", "pending"):
-                    # Convert numeric fields
-                    numeric_fields = ["Quantity", "IssuedQuantity", "Remaining", "PriorityLevel"]
-                    for field in numeric_fields:
-                        if field in record and record[field]:
-                            try:
-                                record[field] = int(record[field])
-                            except ValueError:
-                                record[field] = 0
-                        else:
-                            record[field] = 0
+            if len(all_values) <= 1:  # Только заголовок или пусто
+                logger.info("Таблица пуста или содержит только заголовки")
+                return []
 
-                    active.append(record)
+            headers = all_values[0]
+            active_requests = []
 
-            return active
+            # Определяем индексы нужных колонок
+            try:
+                status_idx = headers.index("Status")
+                resource_idx = headers.index("ResourceName")
+                player_idx = headers.index("DiscordName")
+                character_idx = headers.index("CharacterName")
+                quantity_idx = headers.index("Quantity")
+                issued_idx = headers.index("IssuedQuantity")
+                remaining_idx = headers.index("Remaining")
+                position_idx = headers.index("QueuePosition")
+                priority_idx = headers.index("PriorityLevel")
+                discord_id_idx = headers.index("DiscordID")
+                rowid_idx = headers.index("RowID")
+                resource_grade_idx = headers.index("ResourceGrade")
+            except ValueError as e:
+                logger.error(f"Ошибка поиска колонок: {e}. Доступные колонки: {headers}")
+                return []
+
+            # Проходим по всем строкам, начиная со второй (индекс 1)
+            for i, row in enumerate(all_values[1:], start=2):  # i = реальный номер строки в Google Sheets
+                if len(row) <= max(status_idx, resource_idx, player_idx):
+                    continue  # Пропускаем неполные строки
+
+                status = row[status_idx].strip().lower() if status_idx < len(row) else ""
+
+                # Проверяем только активные заявки
+                if status == "active":
+                    request_dict = {
+                        "__row_number": i,  # Важно! Реальный номер строки в таблице
+                        "RowID": row[rowid_idx] if rowid_idx < len(row) else "",
+                        "DiscordID": row[discord_id_idx] if discord_id_idx < len(row) else "",
+                        "ResourceName": row[resource_idx] if resource_idx < len(row) else "Unknown",
+                        "DiscordName": row[player_idx] if player_idx < len(row) else "Unknown",
+                        "CharacterName": row[character_idx] if character_idx < len(row) else "Unknown",
+                        "ResourceGrade": row[resource_grade_idx] if resource_grade_idx < len(row) else "Blue",
+                        "Quantity": self._safe_int(row[quantity_idx]) if quantity_idx < len(row) else 0,
+                        "IssuedQuantity": self._safe_int(row[issued_idx]) if issued_idx < len(row) else 0,
+                        "Remaining": self._safe_int(row[remaining_idx]) if remaining_idx < len(row) else 0,
+                        "QueuePosition": row[position_idx] if position_idx < len(row) else "?",
+                        "PriorityLevel": self._safe_int(row[priority_idx]) if priority_idx < len(row) else 1,
+                        "Status": status,
+                        # Дополнительные поля из вашей таблицы
+                        "CreatedAt": row[headers.index("CreatedAt")] if "CreatedAt" in headers and headers.index("CreatedAt") < len(row) else "",
+                        "RequestTimestamp": row[headers.index("RequestTimestamp")] if "RequestTimestamp" in headers and headers.index("RequestTimestamp") < len(row) else "",
+                    }
+
+                    active_requests.append(request_dict)
+
+            logger.info(f"Найдено {len(active_requests)} активных заявок")
+            return active_requests
+
         except Exception as e:
-            logger.exception("get_active_requests error: %s", e)
+            logger.exception(f"get_active_requests error: {e}")
             return []
+
+    def _safe_int(self, value: str) -> int:
+        """Безопасное преобразование строки в целое число."""
+        try:
+            if not value or value.strip() == "":
+                return 0
+            return int(float(value))  # Обрабатываем случаи вроде "16.0"
+        except (ValueError, TypeError):
+            return 0
 
     def update_issued_quantity(self, row_number: int, issued_quantity: int,
                                completed: bool = False) -> bool:
